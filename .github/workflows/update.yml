@@ -1,0 +1,35 @@
+name: Upstream rebase
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  rebase_nova_test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+       - name: Checkout
+         uses: actions/checkout@v5
+         with:
+           fetch-depth: 0
+           token: ${{ secrets.GITHUB_TOKEN }}
+           ref: nova-test
+
+       - name: Fetch upstream DRM repo
+         run: |
+           git remote add upstream https://gitlab.freedesktop.org/drm/rust/kernel.git
+           git fetch upstream
+
+       - name: Rebase on drm-rust-next
+         run: |
+           git config user.email "epeer@nvidia.com"
+           git config user.name "Edwin Peer"
+           git reset --hard upstream/drm-rust-next
+           for commit in `git log --reverse --oneline origin/test-infra | cut -f1 -d\ ` ; do git cherry-pick $commit; done
+           if [ $? -ne 0 ]; then
+             echo "Rebase failed!"
+             exit 1
+           fi
+           git push origin --force-with-lease

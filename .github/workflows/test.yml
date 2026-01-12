@@ -1,0 +1,63 @@
+name: Nova Test
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - nova-test
+concurrency:
+  group: nova-ci-cluster
+  cancel-in-progress: false
+jobs:
+  nova-test:
+     runs-on: [ self-hosted ]
+     steps:
+       - name: Fetch
+         uses: actions/checkout@v5
+       - name: Build
+         run: |
+           time KBUILD_BUILD_TIMESTAMP='' make LLVM=1 CC="ccache clang" -j 32
+           time make modules_install INSTALL_MOD_PATH=~/buildroot/modules/usr
+           cd ~/buildroot && make
+       - name: Resolve Targets
+         run: colossus bm lease list -j | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\(.entity_details.id)@\(.entity_details.ipAddress)"' | grep -v "@$" | tee targets.txt
+       - name: Deploy
+         run: |
+           for TARGET in $(cat targets.txt); do
+             IP=${TARGET#*@}
+             scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no /nova/gpu-runner/_work/linux/linux/arch/x86_64/boot/bzImage root@${IP}:/
+             scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ~/buildroot/output/images/rootfs.cpio root@${IP}:/
+             echo "Loading kexec kernel on ${IP}..."
+             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} 'kexec -l /bzImage --initrd=/rootfs.cpio --append="ignore_loglevel console=ttyS1,115200n8"'
+             echo "Booting kernel..."
+             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} "kexec -e" &
+             sleep 15
+             kill %1
+           done
+           echo "Waiting for boot to complete..."
+           sleep 30
+       - name: Test
+         run: |
+           for TARGET in $(cat targets.txt); do
+             IP=${TARGET#*@}
+             RESOURCE=${TARGET%@*}
+             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a ${RESOURCE}.tap
+           done
+       - name: Summarize
+         uses: pcolby/tap-summary@v1
+       - name: Status
+         run: |
+           if cat *.tap | grep "^not ok"; then
+             exit 1
+           else
+             echo All Tests PASSED!
+           fi
+       - name: Cleanup
+         if: always()
+         run: |
+           for TARGET in $(cat targets.txt); do
+             RESOURCE=${TARGET%@*}
+             echo "Rebooting ${RESOURCE}..."
+             colossus bm reboot --resource-id ${RESOURCE}
+           done
+           echo "Waiting..."
+           sleep 180
