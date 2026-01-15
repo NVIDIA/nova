@@ -18,30 +18,39 @@ jobs:
            time KBUILD_BUILD_TIMESTAMP='' make LLVM=1 CC="ccache clang" -j 32
            time make modules_install INSTALL_MOD_PATH=~/buildroot/modules/usr
            cd ~/buildroot && make
-       - name: Resolve Targets
-         run: colossus bm lease list -j | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\(.entity_details.id)@\(.entity_details.ipAddress)"' | grep -v "@$" | tee targets.txt
+       - name: Provision
+         run: |
+           get_leases() {
+             echo "Checking leases..."
+             colossus bm lease list -j | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\(.entity_details.id),\(.entity_details.status),\(.entity_details.ipAddress),\(.entity_details.leaseJustification)"' | tee leases.txt
+           }
+           get_leases
+           grep -v -f <(cut -d, -f5 leases.txt) target-gpu-arch.txt | xargs -I{} colossus bm lease create -d 7d -agb main -agu https://gitlab-master.nvidia.com/epeer/nova-test.git -apb target.yml -lj "Nova CI/CD,{}" -o ubuntu-25.10-x86_64-standard-uefi -f "gpus.architecture={}" "cpus.sockets.arch=x86_64"
+           while grep -v -f <(cut -d, -f5 leases.txt) target-gpu-arch.txt || grep -v RESERVED leases.txt >/dev/null; do
+              sleep 30
+              get_leases
+           done
        - name: Deploy
          run: |
-           for TARGET in $(cat targets.txt); do
-             IP=${TARGET#*@}
-             scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no /nova/gpu-runner/_work/linux/linux/arch/x86_64/boot/bzImage root@${IP}:/
-             scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ~/buildroot/output/images/rootfs.cpio root@${IP}:/
+           SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
+           while IFS= read -r TARGET; do
+             IP=`echo ${TARGET} | cut -d, -f3`
+             scp ${SSH_OPTS} /nova/gpu-runner/_work/linux/linux/arch/x86_64/boot/bzImage root@${IP}:/
+             scp ${SSH_OPTS} ~/buildroot/output/images/rootfs.cpio root@${IP}:/
              echo "Loading kexec kernel on ${IP}..."
-             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} 'kexec -l /bzImage --initrd=/rootfs.cpio --append="ignore_loglevel console=ttyS1,115200n8"'
+             ssh -n ${SSH_OPTS} root@${IP} 'kexec -l /bzImage --initrd=/rootfs.cpio --append="ignore_loglevel console=ttyS1,115200n8"'
              echo "Booting kernel..."
-             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} "kexec -e" &
-             sleep 15
-             kill %1
-           done
+             ssh -n ${SSH_OPTS} root@${IP} "kexec -e" || true 
+           done < leases.txt
            echo "Waiting for boot to complete..."
            sleep 30
        - name: Test
          run: |
-           for TARGET in $(cat targets.txt); do
-             IP=${TARGET#*@}
-             RESOURCE=${TARGET%@*}
-             ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a ${RESOURCE}.tap
-           done
+           while IFS= read -r TARGET; do
+             IP=`echo ${TARGET} | cut -d, -f3`
+             GPU_ARCH=`echo ${TARGET} | cut -d, -f5`
+             ssh -n -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@${IP} "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a ${GPU_ARCH}.tap
+           done < leases.txt
        - name: Summarize
          uses: pcolby/tap-summary@v1
        - name: Status
@@ -54,10 +63,10 @@ jobs:
        - name: Cleanup
          if: always()
          run: |
-           for TARGET in $(cat targets.txt); do
-             RESOURCE=${TARGET%@*}
-             echo "Rebooting ${RESOURCE}..."
-             colossus bm reboot --resource-id ${RESOURCE}
-           done
+           while IFS= read -r TARGET; do
+             ID=`echo ${TARGET} | cut -d, -f1`
+             echo "Rebooting ${ID}..."
+             colossus bm reboot --resource-id ${ID}
+           done < leases.txt
            echo "Waiting..."
            sleep 180
