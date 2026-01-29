@@ -1,4 +1,3 @@
 Ampere
 Blackwell
 Turing
-Hopper
