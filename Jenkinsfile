@@ -1,5 +1,11 @@
 // Nova CI on Blossom — GitHub PR webhook + Colossus hardware tests.
 //
+// Blossom note: Jenkins resolves this Jenkinsfile from the job's pinned ref on
+// https://github.com/NVIDIA/nova (e.g. nova-test), not from open PR branches.
+// Merge pipeline changes to that ref before a PR build will run them; the PR
+// checkout still supplies the kernel tree under test. A separate privileged
+// "Jenkinsfile from PR" job can be added later if needed.
+//
 // Prerequisites (Blossom / your team):
 // - Global Pipeline Library: blossom-github-lib (blossom-github-jenkins-lib on GitLab)
 // - Credential id "github-token" (PAT in password field)
