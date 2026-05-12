@@ -24,6 +24,9 @@
 // - CI image default is public GitLab Container Registry (no imagePullSecrets). If the image
 //   becomes private, add a K8s docker-registry pull secret (namespace SA or pod spec) or reintroduce
 //   imagePullSecrets in the pod yaml below.
+// - podTemplate omits yamlMergeStrategy: PodYamlMergeStrategy is not on the workflow Groovy
+//   classpath on this controller (CPS sandbox throws MissingPropertyException: org). The
+//   Kubernetes plugin merges inline yaml with containerTemplate by default.
 
 @Library('blossom-github-lib@master')
 import ipp.blossom.*
@@ -50,7 +53,6 @@ if (!runUid || !runGid) {
 
 podTemplate(
   cloud: 'sc-ipp-blossom-prod',
-  yamlMergeStrategy: org.csanchez.jenkins.plugins.kubernetes.pipeline.PodYamlMergeStrategy.merge(),
   yaml: """
 apiVersion: v1
 kind: Pod
