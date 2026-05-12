@@ -27,6 +27,10 @@
 // - podTemplate omits yamlMergeStrategy: PodYamlMergeStrategy is not on the workflow Groovy
 //   classpath on this controller (CPS sandbox throws MissingPropertyException: org). The
 //   Kubernetes plugin merges inline yaml with containerTemplate by default.
+// - runAsUser/runAsGroup live on the nova-ci container only, not on the pod. Setting them at
+//   pod scope makes the jnlp inbound-agent run as the NIS uid and crash with
+//   AccessDeniedException: /home/jenkins/agent (the agent workdir is owned by the image's
+//   default jenkins user). Only nova-ci needs the NIS uid for NFS /scratch access.
 
 @Library('blossom-github-lib@master')
 import ipp.blossom.*
@@ -57,9 +61,6 @@ podTemplate(
 apiVersion: v1
 kind: Pod
 spec:
-  securityContext:
-    runAsUser: ${runUid.toInteger()}
-    runAsGroup: ${runGid.toInteger()}
   volumes:
   - name: scratch
     nfs:
@@ -69,14 +70,13 @@ spec:
     kubernetes.io/os: "linux"
   containers:
   - name: jnlp
-    volumeMounts:
-    - name: scratch
-      mountPath: /scratch
   - name: nova-ci
     volumeMounts:
     - name: scratch
       mountPath: /scratch
     securityContext:
+      runAsUser: ${runUid.toInteger()}
+      runAsGroup: ${runGid.toInteger()}
       allowPrivilegeEscalation: false
 """,
   containers: [
