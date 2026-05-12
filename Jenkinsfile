@@ -55,6 +55,21 @@ if (!runUid || !runGid) {
   error('Set job parameters RUN_AS_UID and RUN_AS_GID to your NIS uid/gid from `id` (see Blossom NFS scratch how-to).')
 }
 
+// GithubHelper.updateCommitStatus() retains org.kohsuke.github.GHCommitStatus on the helper,
+// which breaks CPS persistence (NotSerializableException) at step boundaries (build #30:
+// java.io.NotSerializableException: org.kohsuke.github.GHCommitStatus). Build a fresh helper
+// every time we post status so no GHCommitStatus survives into a CPS save point.
+def postCommitStatus(String statusLabel, GitHubCommitState state) {
+  withCredentials([usernamePassword(
+    credentialsId: 'github-token',
+    passwordVariable: 'GIT_PASSWORD',
+    usernameVariable: 'GIT_USERNAME'
+  )]) {
+    def gh = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+    gh.updateCommitStatus("${BUILD_URL}", statusLabel, state)
+  }
+}
+
 podTemplate(
   cloud: 'sc-ipp-blossom-prod',
   yaml: """
@@ -113,36 +128,47 @@ spec:
 
       stageName = 'Code checkout'
       stage(stageName) {
-        githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+        postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
+        // Match the github action workflow's actions/checkout@v5 default (fetch-depth=1):
+        // a full clone of torvalds/linux (~6 GiB / 9.25M deltas) blew the jnlp sidecar in
+        // build #30 ("rev-list died of signal 15"). Use a shallow, single-PR clone with no
+        // tags so the checkout is ~1 order of magnitude smaller and finishes inside the pod.
+        def prNum = githubHelper.getPRNumber()
+        def cloneUrl = githubHelper.getCloneUrl()
+        def cloneExtensions = [
+          [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
+        ]
         if ('Open'.equalsIgnoreCase(githubHelper.getPRState())) {
           checkout changelog: true, poll: false, scm: [
             $class: 'GitSCM',
-            branches: [[name: "pr/${githubHelper.getPRNumber()}"]],
-            extensions: [],
+            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
+            extensions: cloneExtensions,
             userRemoteConfigs: [[
               credentialsId: 'github-token',
-              url: githubHelper.getCloneUrl(),
-              refspec: '+refs/pull/*/head:refs/remotes/origin/pr/*'
+              url: cloneUrl,
+              refspec: "+refs/pull/${prNum}/head:refs/remotes/origin/pr/${prNum}"
             ]]
           ]
         } else if ('Merged'.equalsIgnoreCase(githubHelper.getPRState())) {
           checkout changelog: true, poll: false, scm: [
             $class: 'GitSCM',
-            branches: [[name: githubHelper.getMergedSHA()]],
-            extensions: [],
+            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
+            extensions: cloneExtensions,
             userRemoteConfigs: [[
               credentialsId: 'github-token',
-              url: githubHelper.getCloneUrl(),
-              refspec: '+refs/pull/*/merge:refs/remotes/origin/pr/*'
+              url: cloneUrl,
+              refspec: "+refs/pull/${prNum}/merge:refs/remotes/origin/pr/${prNum}"
             ]]
           ]
+        } else {
+          error("PR state '${githubHelper.getPRState()}' is neither Open nor Merged; nothing to check out.")
         }
       }
 
       stageName = 'Build'
       stage(stageName) {
         container('nova-ci') {
-          githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
           withEnv([
             'CCACHE_DIR=/scratch/ccache',
             'CCACHE_MAXSIZE=50G',
@@ -169,7 +195,7 @@ spec:
       stageName = 'Provision'
       stage(stageName) {
         container('nova-ci') {
-          githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
           withEnv([
             "ANSIBLE_GIT_URL=${params.ANSIBLE_GIT_URL}",
             "ANSIBLE_GIT_BRANCH=${params.ANSIBLE_GIT_BRANCH}",
@@ -198,7 +224,7 @@ spec:
       stageName = 'Deploy'
       stage(stageName) {
         container('nova-ci') {
-          githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
           withEnv([
             'BUILDROOT_OUT=/scratch/buildroot-out',
           ]) {
@@ -226,7 +252,7 @@ spec:
       stageName = 'Test'
       stage(stageName) {
         container('nova-ci') {
-          githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
           sh '''
             set -eux
             SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
@@ -315,7 +341,7 @@ spec:
       }
 
       githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-      githubHelper.updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+      postCommitStatus('Complete', GitHubCommitState.SUCCESS)
 
     } catch (Exception ex) {
       currentBuild.result = 'FAILURE'
@@ -323,7 +349,7 @@ spec:
       if (githubHelper != null) {
         try {
           githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-          githubHelper.updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+          postCommitStatus("${stageName} Failed", GitHubCommitState.FAILURE)
         } catch (Exception ignored) {
           echo "Could not update GitHub status or upload logs: ${ignored}"
         }
