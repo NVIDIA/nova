@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     python3-minimal \
     binutils \
+    time \
     && rm -rf /var/lib/apt/lists/*
 
 # TAP summary script (pcolby/tap-summary, MIT): fetch at image build so agents need no runtime download.

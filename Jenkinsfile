@@ -65,12 +65,11 @@ if (!runUid || !runGid) {
   error('Set job parameters RUN_AS_UID and RUN_AS_GID to your NIS uid/gid from `id` (see Blossom NFS scratch how-to).')
 }
 
-// Status updates are inlined per call site (was: postCommitStatus helper method). Build #37
-// silently produced an empty Code checkout stage body and never reached either Build or the
-// catch block -- I suspect the CPS-transformed helper method with a typed GitHubCommitState
-// parameter was being dropped silently. Inlining sidesteps the helper-method dispatch path
-// entirely. NotSerializable GHCommitStatus is still avoided because the helper instance is
-// chained inline and never stored in a local that survives a save point.
+// Status updates are inlined per call site (was: postCommitStatus helper method): build #37 had
+// an empty Code checkout stage body and never reached Build or the catch block -- the CPS-
+// transformed helper method with a typed GitHubCommitState parameter was being dropped silently.
+// Inlining sidesteps the helper-method dispatch entirely. We also do not retain a GithubHelper
+// instance in a long-lived local across save points (see comment inside the node block below).
 
 podTemplate(
   cloud: 'sc-ipp-blossom-prod',
@@ -116,7 +115,17 @@ spec:
   ]
 ) {
   node(POD_LABEL) {
-    def githubHelper
+    // PR/commit metadata captured as plain strings during Get Token. We deliberately do NOT
+    // keep a GithubHelper instance in a long-lived local: the helper holds GHCommitStatus
+    // references (returned by updateCommitStatus) which are not Serializable, and CPS saves
+    // the program state on every step boundary -- a single live helper local causes
+    // NotSerializableException: org.kohsuke.github.GHCommitStatus on the next save.
+    String buildDescription = ''
+    String prNum = ''
+    String cloneUrl = ''
+    String prState = ''
+    String repoName = ''
+    boolean tokenAcquired = false
     def stageName = ''
 
     stage('Get Token') {
@@ -125,12 +134,18 @@ spec:
         passwordVariable: 'GIT_PASSWORD',
         usernameVariable: 'GIT_USERNAME'
       )]) {
-        githubHelper = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+        def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+        buildDescription = h.getBuildDescription()
+        prNum = h.getPRNumber().toString()
+        cloneUrl = h.getCloneUrl()
+        prState = h.getPRState()
+        repoName = h.getRepoName()
+        tokenAcquired = true
       }
     }
 
     try {
-      currentBuild.description = githubHelper.getBuildDescription()
+      currentBuild.description = buildDescription
 
       stageName = 'Code checkout'
       stage(stageName) {
@@ -143,9 +158,6 @@ spec:
           GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
         }
         echo "DIAG: posted ${stageName} Running status; preparing shallow checkout"
-        def prNum = githubHelper.getPRNumber()
-        def cloneUrl = githubHelper.getCloneUrl()
-        def prState = githubHelper.getPRState()
         echo "DIAG: prNum=${prNum} prState=${prState}"
         def cloneExtensions = [
           [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
@@ -176,54 +188,6 @@ spec:
           error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
         }
         echo "DIAG: checkout returned"
-      }
-
-      // Diagnostic: capture jnlp + nova-ci identity, umask, and workspace permissions before
-      // the heavy Build sh. Build #31/#32/#33/#37 all failed at the first nova-ci sh with
-      // "process apparently never started" / exit -2; need ground truth on uid/gid + dir
-      // ownership to distinguish workspace-permission causes from container-exec causes.
-      stageName = 'Pod diag'
-      stage(stageName) {
-        echo "DIAG: jnlp-side sh"
-        sh '''
-          set -eux
-          echo "--- jnlp identity ---"
-          id
-          pwd
-          umask
-          echo "--- /home/jenkins/agent ---"
-          ls -la /home/jenkins/agent || true
-          echo "--- WORKSPACE ---"
-          ls -la "${WORKSPACE}" 2>/dev/null | head -20 || true
-          echo "--- WORKSPACE@tmp parent ---"
-          ls -la "$(dirname "${WORKSPACE}")" || true
-        '''
-        echo "DIAG: nova-ci-side sh (wrapped in try -- expected to fail with exit -2 if perms hypothesis holds)"
-        try {
-          container('nova-ci') {
-            sh '''
-              set -eux
-              echo "--- nova-ci identity ---"
-              id
-              pwd
-              umask
-              echo "--- /home/jenkins/agent ---"
-              ls -la /home/jenkins/agent || true
-              echo "--- WORKSPACE ---"
-              ls -la "${WORKSPACE}" 2>/dev/null | head -20 || true
-              echo "--- can nova-ci write to WORKSPACE? ---"
-              if touch "${WORKSPACE}/.diag-write-test-from-nova-ci" 2>&1; then
-                echo "WRITE OK"
-                rm -f "${WORKSPACE}/.diag-write-test-from-nova-ci"
-              else
-                echo "WRITE FAILED"
-              fi
-            '''
-          }
-        } catch (Exception diagEx) {
-          echo "DIAG: nova-ci sh failed (expected if perms hypothesis holds): ${diagEx}"
-        }
-        echo "DIAG: end of Pod diag"
       }
 
       stageName = 'Build'
@@ -381,8 +345,8 @@ spec:
               usernameVariable: 'GIT_USERNAME'
             )]) {
               withEnv([
-                "GH_REPO=${githubHelper.getRepoName()}",
-                "GH_ISSUE=${githubHelper.getPRNumber().toString()}",
+                "GH_REPO=${repoName}",
+                "GH_ISSUE=${prNum}",
               ]) {
                 sh '''
                   set -eu
@@ -425,27 +389,29 @@ spec:
         }
       }
 
-      githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
       withCredentials([usernamePassword(
         credentialsId: 'github-token',
         passwordVariable: 'GIT_PASSWORD',
         usernameVariable: 'GIT_USERNAME'
       )]) {
-        GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+        def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+        h.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
+        h.updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
       }
 
     } catch (Exception ex) {
       currentBuild.result = 'FAILURE'
       echo "DIAG-catch: ${ex}"
-      if (githubHelper != null) {
+      if (tokenAcquired) {
         try {
-          githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
           withCredentials([usernamePassword(
             credentialsId: 'github-token',
             passwordVariable: 'GIT_PASSWORD',
             usernameVariable: 'GIT_USERNAME'
           )]) {
-            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+            h.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
+            h.updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status or upload logs: ${ignored}"
