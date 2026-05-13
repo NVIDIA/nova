@@ -70,6 +70,12 @@ spec:
     kubernetes.io/os: "linux"
   containers:
   - name: jnlp
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 500m
+      limits:
+        memory: 2Gi
   - name: nova-ci
     volumeMounts:
     - name: scratch
