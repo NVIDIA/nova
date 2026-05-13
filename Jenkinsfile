@@ -27,18 +27,20 @@
 // - podTemplate omits yamlMergeStrategy: PodYamlMergeStrategy is not on the workflow Groovy
 //   classpath on this controller (CPS sandbox throws MissingPropertyException: org). The
 //   Kubernetes plugin merges inline yaml with containerTemplate by default.
-// - Both containers run as the NIS uid via pod-level runAsUser/runAsGroup. Build #38 diag
-//   showed the root cause of the recurring durable-task exit -2: jnlp (uid 1000:1000, umask
-//   0022) was creating workspace dirs as 0755 jenkins:jenkins, so nova-ci (uid 150707 gid 30)
-//   could not write workspace/nova-cicd@tmp/durable-XXX/jenkins-log.txt -- durable-task wrapper
-//   exited silently and we got "process apparently never started". Fix: run both containers as
-//   the same uid so owner-write is enough, no group/umask gymnastics. Same #38 diag showed
-//   /home/jenkins/agent comes up as 0777 root:root regardless of who jnlp is, so uid 150707
-//   can write there without fsGroup.
-//   No fsGroup: kubelet applies fsGroup to "nfs" volumes too, which would trigger a chown over
+// - jnlp keeps the image's default uid 1000 (overriding it makes jnlp crash with
+//   AccessDeniedException: /home/jenkins/agent -- whatever the image's entrypoint does to the
+//   volume mount only works as the built-in jenkins user). We only override runAsGroup=30 and
+//   the command, so jnlp's process runs uid 1000 gid 30 with umask 0002 -- new dirs come out
+//   mode 0775 owned 1000:30 instead of 0755 1000:1000. nova-ci (uid 150707 gid 30) can then
+//   write into them via group permission. This is the root cause of the durable-task exit -2
+//   we hit through #31..#38: jnlp created workspace/nova-cicd@tmp/ at 0755 jenkins:jenkins, so
+//   nova-ci could not drop jenkins-log.txt / pid into durable-XXX/ -- the wrapper exited before
+//   producing any output and durable-task reported "process apparently never started".
+// - No fsGroup: kubelet applies fsGroup to "nfs" volumes too, which would trigger a chown over
 //   the /scratch NFS export. The export is root-squashed, so kubelet's chown maps to nobody on
-//   the server and fails (or logs a kubelet warning, depending on K8s version + fsGroupChangePolicy).
-//   We don't need it -- same-uid in both containers solves the workspace perms cleanly.
+//   the server (the export is owned 150707:30, not root) -- so fsGroup would either fail pod
+//   startup or log a noisy kubelet warning, depending on fsGroupChangePolicy. Same-gid in both
+//   containers plus jnlp umask 0002 solves the workspace problem cleanly without touching NFS.
 
 @Library('blossom-github-lib@master')
 import ipp.blossom.*
@@ -76,9 +78,6 @@ podTemplate(
 apiVersion: v1
 kind: Pod
 spec:
-  securityContext:
-    runAsUser: ${runUid.toInteger()}
-    runAsGroup: ${runGid.toInteger()}
   volumes:
   - name: scratch
     nfs:
@@ -88,6 +87,10 @@ spec:
     kubernetes.io/os: "linux"
   containers:
   - name: jnlp
+    command: ["/bin/sh", "-c"]
+    args: ["umask 0002 && exec /usr/local/bin/jenkins-agent"]
+    securityContext:
+      runAsGroup: ${runGid.toInteger()}
     resources:
       requests:
         memory: 1Gi
@@ -99,6 +102,8 @@ spec:
     - name: scratch
       mountPath: /scratch
     securityContext:
+      runAsUser: ${runUid.toInteger()}
+      runAsGroup: ${runGid.toInteger()}
       allowPrivilegeEscalation: false
 """,
   containers: [
