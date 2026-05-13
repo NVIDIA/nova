@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     unzip \
     xz-utils \
+    zstd \
     zlib1g-dev \
     clang \
     lld \
