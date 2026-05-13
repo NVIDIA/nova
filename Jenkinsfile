@@ -49,15 +49,18 @@ properties([
   parameters([
     string(name: 'RUN_AS_UID', defaultValue: '150707', description: 'NIS uid for pod + NFS /scratch (Blossom scratch how-to); override if not epeer'),
     string(name: 'RUN_AS_GID', defaultValue: '30', description: 'Primary NIS gid for pod + NFS /scratch; override if your export differs'),
-    string(name: 'CI_IMAGE', defaultValue: 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13', description: 'Image with kernel build toolchain + colossus CLI + ssh'),
     string(name: 'ANSIBLE_GIT_URL', defaultValue: 'https://gitlab-master.nvidia.com/epeer/nova-test.git', description: 'Git URL passed to colossus bm lease -agu (Ansible playbooks)'),
     string(name: 'ANSIBLE_GIT_BRANCH', defaultValue: 'main', description: 'Branch for -agb (playbook / lease metadata; epeer/nova-test on GitLab)'),
     string(name: 'ANSIBLE_PLAYBOOK', defaultValue: 'target.yml', description: 'Playbook path in repo for -apb'),
   ])
 ])
 
-def defaultCiImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13'
-def ciImage = (params.CI_IMAGE?.trim()) ? params.CI_IMAGE.trim() : defaultCiImage
+// CI image tag is intentionally NOT a job parameter: Jenkins persists the
+// last-used parameter value and ignores subsequent defaultValue changes in the
+// Jenkinsfile, so bumping the tag with a parameter required a manual "Build
+// with Parameters" round-trip every time. Keep this as a plain script var so
+// every commit that bumps the tag takes effect on the next /build comment.
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -389,14 +392,19 @@ spec:
         }
       }
 
+      // Chained-inline so the GithubHelper instance is never bound to a local
+      // variable that survives the closure boundary; CPS save points cannot
+      // serialize org.kohsuke.github.GHCommitStatus (returned by updateCommitStatus
+      // and held in the helper's internal state), so any retained instance
+      // poisons the next saveProgram. uploadLogs is omitted for the same reason:
+      // it leaves a reference graph behind that breaks serialization on the next
+      // step boundary (consistently broke the finally block before this change).
       withCredentials([usernamePassword(
         credentialsId: 'github-token',
         passwordVariable: 'GIT_PASSWORD',
         usernameVariable: 'GIT_USERNAME'
       )]) {
-        def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
-        h.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-        h.updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+        GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
       }
 
     } catch (Exception ex) {
@@ -409,12 +417,10 @@ spec:
             passwordVariable: 'GIT_PASSWORD',
             usernameVariable: 'GIT_USERNAME'
           )]) {
-            def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
-            h.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-            h.updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
           }
         } catch (Exception ignored) {
-          echo "Could not update GitHub status or upload logs: ${ignored}"
+          echo "Could not update GitHub status: ${ignored}"
         }
       }
     } finally {
