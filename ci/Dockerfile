@@ -1,10 +1,11 @@
-# Nova kernel CI agent — Blossom Jenkins `nova-ci` container.
-# Build (from repo root): docker build -f ci/Dockerfile -t YOUR_REGISTRY/nova-kernel-ci:TAG .
-# Optional build-args:
+# Nova kernel CI agent — Blossom Jenkins `nova-ci` container — public base layer.
+# To build + push the full image (this base + the private colossus layer), run:
+#   ci/build-image.sh --push                   # tag = today (YYYY-MM-DD)
+#   ci/build-image.sh --push --tag 2026-05-13  # explicit tag
+# Optional build-args (passed through by the script):
 #   TAP_SUMMARY_GIT_SHA=<commit> — pin pcolby/tap-summary summary.gawk (default below).
 #   BUILDROOT_REPO / BUILDROOT_BRANCH — Nova Buildroot fork (default: espeer/buildroot, nova-test).
 #   BUILDROOT_GIT_SHA=<commit> — if set, full clone then checkout this SHA (else shallow clone of branch).
-# Push per your registry (e.g. gitlab-master container registry, urm.nvidia.com — see internal docs).
 #
 # Buildroot *sources* live in /opt/buildroot; Jenkins sets BUILDROOT_OUT (e.g. /scratch/buildroot-out) and runs:
 #   make -C /opt/buildroot O=/scratch/buildroot-out
@@ -84,7 +85,7 @@ RUN set -eux; \
     chmod -R a+rX /opt/buildroot; \
     rm -rf /opt/buildroot/.git
 
-# Colossus CLI is internal — add in a private image layer, e.g.:
+# Colossus CLI is internal and added on top by ci/build-image.sh:
 #   COPY --chmod=0755 colossus /usr/local/bin/colossus
 # The Jenkinsfile expects `colossus` on PATH for Provision.
 
