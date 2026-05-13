@@ -27,10 +27,18 @@
 // - podTemplate omits yamlMergeStrategy: PodYamlMergeStrategy is not on the workflow Groovy
 //   classpath on this controller (CPS sandbox throws MissingPropertyException: org). The
 //   Kubernetes plugin merges inline yaml with containerTemplate by default.
-// - runAsUser/runAsGroup live on the nova-ci container only, not on the pod. Setting them at
-//   pod scope makes the jnlp inbound-agent run as the NIS uid and crash with
-//   AccessDeniedException: /home/jenkins/agent (the agent workdir is owned by the image's
-//   default jenkins user). Only nova-ci needs the NIS uid for NFS /scratch access.
+// - Both containers run as the NIS uid via pod-level runAsUser/runAsGroup. Build #38 diag
+//   showed the root cause of the recurring durable-task exit -2: jnlp (uid 1000:1000, umask
+//   0022) was creating workspace dirs as 0755 jenkins:jenkins, so nova-ci (uid 150707 gid 30)
+//   could not write workspace/nova-cicd@tmp/durable-XXX/jenkins-log.txt -- durable-task wrapper
+//   exited silently and we got "process apparently never started". Fix: run both containers as
+//   the same uid so owner-write is enough, no group/umask gymnastics. Same #38 diag showed
+//   /home/jenkins/agent comes up as 0777 root:root regardless of who jnlp is, so uid 150707
+//   can write there without fsGroup.
+//   No fsGroup: kubelet applies fsGroup to "nfs" volumes too, which would trigger a chown over
+//   the /scratch NFS export. The export is root-squashed, so kubelet's chown maps to nobody on
+//   the server and fails (or logs a kubelet warning, depending on K8s version + fsGroupChangePolicy).
+//   We don't need it -- same-uid in both containers solves the workspace perms cleanly.
 
 @Library('blossom-github-lib@master')
 import ipp.blossom.*
@@ -68,6 +76,9 @@ podTemplate(
 apiVersion: v1
 kind: Pod
 spec:
+  securityContext:
+    runAsUser: ${runUid.toInteger()}
+    runAsGroup: ${runGid.toInteger()}
   volumes:
   - name: scratch
     nfs:
@@ -88,8 +99,6 @@ spec:
     - name: scratch
       mountPath: /scratch
     securityContext:
-      runAsUser: ${runUid.toInteger()}
-      runAsGroup: ${runGid.toInteger()}
       allowPrivilegeEscalation: false
 """,
   containers: [
