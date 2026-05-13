@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     flex \
     libssl-dev \
     libelf-dev \
+    libdw-dev \
     libncurses-dev \
     dwarves \
     pahole \

@@ -60,7 +60,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13-2'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -399,12 +399,18 @@ spec:
       // poisons the next saveProgram. uploadLogs is omitted for the same reason:
       // it leaves a reference graph behind that breaks serialization on the next
       // step boundary (consistently broke the finally block before this change).
+      // The trailing echo is load-bearing: it overwrites the closure's
+      // ValueBoundContinuation.v (the in-flight return value of the last
+      // expression) with the echo step's null return. Without it, the
+      // GHCommitStatus returned by updateCommitStatus sits in v until the
+      // next save -- entering finally's container() -- and dies there.
       withCredentials([usernamePassword(
         credentialsId: 'github-token',
         passwordVariable: 'GIT_PASSWORD',
         usernameVariable: 'GIT_USERNAME'
       )]) {
         GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+        echo "DIAG: posted Complete SUCCESS status"
       }
 
     } catch (Exception ex) {
@@ -418,6 +424,7 @@ spec:
             usernameVariable: 'GIT_USERNAME'
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            echo "DIAG: posted ${stageName} Failed status"
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status: ${ignored}"
