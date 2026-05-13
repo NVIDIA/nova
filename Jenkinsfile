@@ -49,14 +49,14 @@ properties([
   parameters([
     string(name: 'RUN_AS_UID', defaultValue: '150707', description: 'NIS uid for pod + NFS /scratch (Blossom scratch how-to); override if not epeer'),
     string(name: 'RUN_AS_GID', defaultValue: '30', description: 'Primary NIS gid for pod + NFS /scratch; override if your export differs'),
-    string(name: 'CI_IMAGE', defaultValue: 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-04-14', description: 'Image with kernel build toolchain + colossus CLI + ssh'),
+    string(name: 'CI_IMAGE', defaultValue: 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13', description: 'Image with kernel build toolchain + colossus CLI + ssh'),
     string(name: 'ANSIBLE_GIT_URL', defaultValue: 'https://gitlab-master.nvidia.com/epeer/nova-test.git', description: 'Git URL passed to colossus bm lease -agu (Ansible playbooks)'),
     string(name: 'ANSIBLE_GIT_BRANCH', defaultValue: 'main', description: 'Branch for -agb (playbook / lease metadata; epeer/nova-test on GitLab)'),
     string(name: 'ANSIBLE_PLAYBOOK', defaultValue: 'target.yml', description: 'Playbook path in repo for -apb'),
   ])
 ])
 
-def defaultCiImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-04-14'
+def defaultCiImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13'
 def ciImage = (params.CI_IMAGE?.trim()) ? params.CI_IMAGE.trim() : defaultCiImage
 
 def runUid = params.RUN_AS_UID?.trim()
