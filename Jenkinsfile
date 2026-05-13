@@ -55,20 +55,12 @@ if (!runUid || !runGid) {
   error('Set job parameters RUN_AS_UID and RUN_AS_GID to your NIS uid/gid from `id` (see Blossom NFS scratch how-to).')
 }
 
-// GithubHelper.updateCommitStatus() retains org.kohsuke.github.GHCommitStatus on the helper,
-// which breaks CPS persistence (NotSerializableException) at step boundaries (build #30:
-// java.io.NotSerializableException: org.kohsuke.github.GHCommitStatus). Build a fresh helper
-// every time we post status so no GHCommitStatus survives into a CPS save point.
-def postCommitStatus(String statusLabel, GitHubCommitState state) {
-  withCredentials([usernamePassword(
-    credentialsId: 'github-token',
-    passwordVariable: 'GIT_PASSWORD',
-    usernameVariable: 'GIT_USERNAME'
-  )]) {
-    def gh = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
-    gh.updateCommitStatus("${BUILD_URL}", statusLabel, state)
-  }
-}
+// Status updates are inlined per call site (was: postCommitStatus helper method). Build #37
+// silently produced an empty Code checkout stage body and never reached either Build or the
+// catch block -- I suspect the CPS-transformed helper method with a typed GitHubCommitState
+// parameter was being dropped silently. Inlining sidesteps the helper-method dispatch path
+// entirely. NotSerializable GHCommitStatus is still avoided because the helper instance is
+// chained inline and never stored in a local that survives a save point.
 
 podTemplate(
   cloud: 'sc-ipp-blossom-prod',
@@ -128,17 +120,23 @@ spec:
 
       stageName = 'Code checkout'
       stage(stageName) {
-        postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
-        // Match the github action workflow's actions/checkout@v5 default (fetch-depth=1):
-        // a full clone of torvalds/linux (~6 GiB / 9.25M deltas) blew the jnlp sidecar in
-        // build #30 ("rev-list died of signal 15"). Use a shallow, single-PR clone with no
-        // tags so the checkout is ~1 order of magnitude smaller and finishes inside the pod.
+        echo "DIAG: entered ${stageName} body"
+        withCredentials([usernamePassword(
+          credentialsId: 'github-token',
+          passwordVariable: 'GIT_PASSWORD',
+          usernameVariable: 'GIT_USERNAME'
+        )]) {
+          GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+        }
+        echo "DIAG: posted ${stageName} Running status; preparing shallow checkout"
         def prNum = githubHelper.getPRNumber()
         def cloneUrl = githubHelper.getCloneUrl()
+        def prState = githubHelper.getPRState()
+        echo "DIAG: prNum=${prNum} prState=${prState}"
         def cloneExtensions = [
           [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
         ]
-        if ('Open'.equalsIgnoreCase(githubHelper.getPRState())) {
+        if ('Open'.equalsIgnoreCase(prState)) {
           checkout changelog: true, poll: false, scm: [
             $class: 'GitSCM',
             branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
@@ -149,7 +147,7 @@ spec:
               refspec: "+refs/pull/${prNum}/head:refs/remotes/origin/pr/${prNum}"
             ]]
           ]
-        } else if ('Merged'.equalsIgnoreCase(githubHelper.getPRState())) {
+        } else if ('Merged'.equalsIgnoreCase(prState)) {
           checkout changelog: true, poll: false, scm: [
             $class: 'GitSCM',
             branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
@@ -161,14 +159,69 @@ spec:
             ]]
           ]
         } else {
-          error("PR state '${githubHelper.getPRState()}' is neither Open nor Merged; nothing to check out.")
+          error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
         }
+        echo "DIAG: checkout returned"
+      }
+
+      // Diagnostic: capture jnlp + nova-ci identity, umask, and workspace permissions before
+      // the heavy Build sh. Build #31/#32/#33/#37 all failed at the first nova-ci sh with
+      // "process apparently never started" / exit -2; need ground truth on uid/gid + dir
+      // ownership to distinguish workspace-permission causes from container-exec causes.
+      stageName = 'Pod diag'
+      stage(stageName) {
+        echo "DIAG: jnlp-side sh"
+        sh '''
+          set -eux
+          echo "--- jnlp identity ---"
+          id
+          pwd
+          umask
+          echo "--- /home/jenkins/agent ---"
+          ls -la /home/jenkins/agent || true
+          echo "--- WORKSPACE ---"
+          ls -la "${WORKSPACE}" 2>/dev/null | head -20 || true
+          echo "--- WORKSPACE@tmp parent ---"
+          ls -la "$(dirname "${WORKSPACE}")" || true
+        '''
+        echo "DIAG: nova-ci-side sh (wrapped in try -- expected to fail with exit -2 if perms hypothesis holds)"
+        try {
+          container('nova-ci') {
+            sh '''
+              set -eux
+              echo "--- nova-ci identity ---"
+              id
+              pwd
+              umask
+              echo "--- /home/jenkins/agent ---"
+              ls -la /home/jenkins/agent || true
+              echo "--- WORKSPACE ---"
+              ls -la "${WORKSPACE}" 2>/dev/null | head -20 || true
+              echo "--- can nova-ci write to WORKSPACE? ---"
+              if touch "${WORKSPACE}/.diag-write-test-from-nova-ci" 2>&1; then
+                echo "WRITE OK"
+                rm -f "${WORKSPACE}/.diag-write-test-from-nova-ci"
+              else
+                echo "WRITE FAILED"
+              fi
+            '''
+          }
+        } catch (Exception diagEx) {
+          echo "DIAG: nova-ci sh failed (expected if perms hypothesis holds): ${diagEx}"
+        }
+        echo "DIAG: end of Pod diag"
       }
 
       stageName = 'Build'
       stage(stageName) {
         container('nova-ci') {
-          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          }
           withEnv([
             'CCACHE_DIR=/scratch/ccache',
             'CCACHE_MAXSIZE=50G',
@@ -195,7 +248,13 @@ spec:
       stageName = 'Provision'
       stage(stageName) {
         container('nova-ci') {
-          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          }
           withEnv([
             "ANSIBLE_GIT_URL=${params.ANSIBLE_GIT_URL}",
             "ANSIBLE_GIT_BRANCH=${params.ANSIBLE_GIT_BRANCH}",
@@ -224,7 +283,13 @@ spec:
       stageName = 'Deploy'
       stage(stageName) {
         container('nova-ci') {
-          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          }
           withEnv([
             'BUILDROOT_OUT=/scratch/buildroot-out',
           ]) {
@@ -252,7 +317,13 @@ spec:
       stageName = 'Test'
       stage(stageName) {
         container('nova-ci') {
-          postCommitStatus("${stageName} Running", GitHubCommitState.PENDING)
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          }
           sh '''
             set -eux
             SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
@@ -341,15 +412,27 @@ spec:
       }
 
       githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-      postCommitStatus('Complete', GitHubCommitState.SUCCESS)
+      withCredentials([usernamePassword(
+        credentialsId: 'github-token',
+        passwordVariable: 'GIT_PASSWORD',
+        usernameVariable: 'GIT_USERNAME'
+      )]) {
+        GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+      }
 
     } catch (Exception ex) {
       currentBuild.result = 'FAILURE'
-      echo "${ex}"
+      echo "DIAG-catch: ${ex}"
       if (githubHelper != null) {
         try {
           githubHelper.uploadLogs(this, env.JOB_NAME, env.BUILD_NUMBER, null, null)
-          postCommitStatus("${stageName} Failed", GitHubCommitState.FAILURE)
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+          }
         } catch (Exception ignored) {
           echo "Could not update GitHub status or upload logs: ${ignored}"
         }
