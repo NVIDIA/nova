@@ -21,13 +21,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    wget \
     git \
     make \
+    patch \
     pkg-config \
     build-essential \
     bc \
     bison \
     flex \
+    file \
+    bzip2 \
+    perl \
+    which \
     libssl-dev \
     libelf-dev \
     libdw-dev \

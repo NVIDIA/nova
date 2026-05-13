@@ -60,7 +60,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13-3'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13-4'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -208,10 +208,14 @@ spec:
             'CCACHE_MAXSIZE=50G',
             'BUILDROOT_SRC=/opt/buildroot',
             'BUILDROOT_OUT=/scratch/buildroot-out',
+            // Buildroot defaults DL_DIR to $(TOPDIR)/dl, i.e. /opt/buildroot/dl.
+            // /opt/buildroot is baked read-only into the image (a+rX, no a+w)
+            // so cross-build downloads are forced onto writable NFS scratch.
+            'BR2_DL_DIR=/scratch/buildroot-dl',
           ]) {
             sh '''
               set -eux
-              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}"
+              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}" "${BR2_DL_DIR}"
               export KBUILD_BUILD_TIMESTAMP=''
               if [ ! -f "${BUILDROOT_OUT}/.config" ]; then
                 cp "${BUILDROOT_SRC}/.config" "${BUILDROOT_OUT}/.config"
