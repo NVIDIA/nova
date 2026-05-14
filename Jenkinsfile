@@ -204,13 +204,30 @@ spec:
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
           withEnv([
+            // ccache cache: lives on /scratch (NFS). ccache is content-addressed
+            // (keyed by source+flags hash), so file mtime is irrelevant and the
+            // NFS clock skew that bites make-based incremental builds is a non-
+            // issue here. Cross-pod cache hits are worth the extra latency.
             'CCACHE_DIR=/scratch/ccache',
             'CCACHE_MAXSIZE=50G',
             'BUILDROOT_SRC=/opt/buildroot',
-            'BUILDROOT_OUT=/scratch/buildroot-out',
+            // Active build output: pod-local emptyDir (NOT /scratch). Two
+            // reasons: (1) the Blossom NFS server clock runs ~10-15s ahead
+            // of the pod clock, so any file make creates on /scratch lands
+            // with a future mtime relative to the pod; cmake's try_compile()
+            // during host-cmake bootstrap produced bogus "unique_ptr - no"
+            // verdicts because the sub-make couldn't trust mtime ordering
+            // (build #45). (2) ~all build I/O is hot rewrites of .o/.a/.ko/
+            // staging files -- pod-local SSD beats NFS round-trips by an
+            // order of magnitude. ccache still accelerates compilation
+            // because the compiler invocation is what's wrapped, regardless
+            // of where the output lands.
+            'BUILDROOT_OUT=/home/jenkins/agent/buildroot-out',
             // Buildroot defaults DL_DIR to $(TOPDIR)/dl, i.e. /opt/buildroot/dl.
             // /opt/buildroot is baked read-only into the image (a+rX, no a+w)
             // so cross-build downloads are forced onto writable NFS scratch.
+            // Like ccache, this is a content cache (tarballs verified by sha)
+            // so mtime semantics don't matter and cross-pod sharing is gold.
             'BR2_DL_DIR=/scratch/buildroot-dl',
           ]) {
             sh '''
