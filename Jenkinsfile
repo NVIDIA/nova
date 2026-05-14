@@ -107,6 +107,17 @@ spec:
       runAsUser: ${runUid.toInteger()}
       runAsGroup: ${runGid.toInteger()}
       allowPrivilegeEscalation: false
+    resources:
+      requests:
+        # Reserved per pod -- conservative so the scheduler still places us.
+        memory: 16Gi
+        cpu: "8"
+      limits:
+        # Build #46 OOM-killed cc1plus while buildroot was bootstrapping cmake
+        # under -j128: at peak the C++ host-tools compile easily wants 80+ GiB.
+        # Set a roomy ceiling so this stops being a recurring failure mode.
+        memory: 64Gi
+        cpu: "64"
 """,
   containers: [
     containerTemplate(
@@ -239,9 +250,17 @@ spec:
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
               JN="$(nproc 2>/dev/null || echo 32)"
+              # Buildroot's host-tools build (notably the host-cmake stage)
+              # spawns big cc1plus translation units; at -j$(nproc)=128 peak
+              # RSS easily exceeds the container memory limit and the OOM
+              # killer takes out cc1plus mid-compile (build #46). Cap the
+              # buildroot job-count to something the memory budget can
+              # actually feed in parallel; the kernel build above stays at
+              # full ${JN} since clang TUs are much smaller.
+              BR_JN="$(( JN > 32 ? 32 : JN ))"
               time make LLVM=1 CC="ccache clang" -j"${JN}"
               time make modules_install INSTALL_MOD_PATH="${BUILDROOT_OUT}/output/target/usr"
-              time make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" -j"${JN}"
+              time make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" -j"${BR_JN}"
             '''
           }
         }
