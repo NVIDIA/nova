@@ -221,6 +221,21 @@ spec:
             // issue here. Cross-pod cache hits are worth the extra latency.
             'CCACHE_DIR=/scratch/ccache',
             'CCACHE_MAXSIZE=50G',
+            // Buildroot's target-build ccache: same dir as the host ccache.
+            // Unifies the cache across kernel + buildroot + cross-pod, and
+            // (importantly) overrides buildroot's default of
+            // $HOME/.buildroot-ccache -- our pod runs as a NIS uid with no
+            // /etc/passwd entry, so $HOME is empty and host-ccache's install
+            // step tried `mkdir -p //.buildroot-ccache` and died with
+            // "Permission denied" (build #47).
+            'BR2_CCACHE_DIR=/scratch/ccache',
+            // Many host packages (libtool, autotools generators, perl,
+            // python wheels, etc.) consult $HOME at build time. With our
+            // NIS uid unmapped in the container, login resolution returns
+            // empty HOME and tools try to write to /. Pin it to the pod-
+            // local agent dir which is owned by jnlp (1000:30) with g+w
+            // and reachable by nova-ci (150707:30) via the shared gid.
+            'HOME=/home/jenkins/agent',
             'BUILDROOT_SRC=/opt/buildroot',
             // Active build output: pod-local emptyDir (NOT /scratch). Two
             // reasons: (1) the Blossom NFS server clock runs ~10-15s ahead
