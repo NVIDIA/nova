@@ -60,7 +60,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-13-4'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-14'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()

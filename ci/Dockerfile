@@ -56,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     gawk \
     openssh-client \
-    python3-minimal \
+    python3 \
     binutils \
     time \
     && rm -rf /var/lib/apt/lists/*
