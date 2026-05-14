@@ -258,10 +258,21 @@ spec:
           ]) {
             sh '''
               set -eux
-              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}" "${BR2_DL_DIR}"
+              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}" "${BR2_DL_DIR}" "${BUILDROOT_OUT}/modules"
               export KBUILD_BUILD_TIMESTAMP=''
               if [ ! -f "${BUILDROOT_OUT}/.config" ]; then
                 cp "${BUILDROOT_SRC}/.config" "${BUILDROOT_OUT}/.config"
+                # The image's defconfig hard-codes
+                #   BR2_ROOTFS_OVERLAY="/opt/buildroot/modules /opt/buildroot/overlay"
+                # The first path is meant to be populated by *this* job's
+                # kernel modules_install, but /opt/buildroot is baked
+                # read-only into the image and that subdir doesn't even
+                # exist -- target-finalize's rsync died with
+                #   change_dir "/opt/buildroot/modules" failed: No such file or directory
+                # (build #49). Redirect the modules overlay at a writable
+                # pod-local dir; we populate it from modules_install below
+                # before buildroot's target-finalize phase rsyncs from it.
+                sed -i "s|/opt/buildroot/modules|${BUILDROOT_OUT}/modules|g" "${BUILDROOT_OUT}/.config"
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
               JN="$(nproc 2>/dev/null || echo 32)"
@@ -274,7 +285,7 @@ spec:
               # full ${JN} since clang TUs are much smaller.
               BR_JN="$(( JN > 32 ? 32 : JN ))"
               time make LLVM=1 CC="ccache clang" -j"${JN}"
-              time make modules_install INSTALL_MOD_PATH="${BUILDROOT_OUT}/output/target/usr"
+              time make modules_install INSTALL_MOD_PATH="${BUILDROOT_OUT}/modules"
               time make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" -j"${BR_JN}"
             '''
           }
@@ -327,13 +338,17 @@ spec:
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
           withEnv([
-            'BUILDROOT_OUT=/scratch/buildroot-out',
+            // Same pod-local emptyDir as the Build stage (the rootfs.cpio
+            // is produced there; /scratch isn't where it lands). With
+            // O=${BUILDROOT_OUT} set explicitly, images/ is a direct
+            // child of BUILDROOT_OUT -- no "output/" prefix.
+            'BUILDROOT_OUT=/home/jenkins/agent/buildroot-out',
           ]) {
           sh '''
             set -eux
             SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
             BZIMAGE="${WORKSPACE}/arch/x86_64/boot/bzImage"
-            INITRD="${BUILDROOT_OUT}/output/images/rootfs.cpio"
+            INITRD="${BUILDROOT_OUT}/images/rootfs.cpio"
             while IFS= read -r TARGET; do
               IP=$(echo "${TARGET}" | cut -d, -f3)
               scp ${SSH_OPTS} "${BZIMAGE}" "root@${IP}:/"
