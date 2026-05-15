@@ -265,19 +265,18 @@ spec:
                 # The image's defconfig sets
                 #   BR2_ROOTFS_OVERLAY="modules overlay"
                 # which buildroot resolves *relative to its topdir*
-                # /opt/buildroot. The first path is meant to receive this
-                # job's kernel modules, but /opt/buildroot is baked
-                # read-only into the image (a+rX, no a+w) and the modules
-                # subdir doesn't even exist -- target-finalize's rsync
-                # died with
-                #   change_dir "/opt/buildroot/modules" failed: No such file or directory
-                # in builds #49 / #50. Rewrite the modules entry as an
-                # absolute path under a writable pod-local dir; we
-                # populate it from modules_install below before
-                # buildroot's target-finalize rsyncs from it. Keep the
-                # second entry pointing at /opt/buildroot/overlay (static
-                # rootfs additions baked into the image).
-                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /opt/buildroot/overlay"|' "${BUILDROOT_OUT}/.config"
+                # /opt/buildroot. Both subdirs are placeholders that the
+                # CI is meant to populate -- neither exists in
+                # espeer/buildroot:nova-test (the fork the image clones)
+                # and /opt/buildroot is baked read-only into the image
+                # anyway. Build #52 confirmed both paths break rsync:
+                # the "modules" path with no source dir tripped #49/#50,
+                # and after sending modules elsewhere, the still-missing
+                # "overlay" path then tripped #52 with the same error.
+                # Rewrite the overlay list down to a single absolute
+                # entry pointing at a writable pod-local dir where we
+                # deposit kernel modules via modules_install below.
+                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules"|' "${BUILDROOT_OUT}/.config"
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
               JN="$(nproc 2>/dev/null || echo 32)"
