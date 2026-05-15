@@ -290,7 +290,16 @@ spec:
               # full ${JN} since clang TUs are much smaller.
               BR_JN="$(( JN > 32 ? 32 : JN ))"
               time make LLVM=1 CC="ccache clang" -j"${JN}"
-              time make modules_install INSTALL_MOD_PATH="${BUILDROOT_OUT}/modules"
+              # Note the /usr suffix: kernel modules_install always writes
+              # <INSTALL_MOD_PATH>/lib/modules/<ver>, but the buildroot
+              # target uses a merged-/usr layout and rejects an overlay
+              # that has a top-level /lib (build #51 died with
+              #   ERROR: The overlay in .../modules is not using a merged
+              #   /usr for the following directories: /lib
+              # ). Setting INSTALL_MOD_PATH to <overlay>/usr puts modules
+              # at <overlay>/usr/lib/modules/<ver>/, which is what the
+              # merged-/usr sanity check wants.
+              time make modules_install INSTALL_MOD_PATH="${BUILDROOT_OUT}/modules/usr"
               time make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" -j"${BR_JN}"
             '''
           }
