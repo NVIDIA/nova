@@ -262,17 +262,22 @@ spec:
               export KBUILD_BUILD_TIMESTAMP=''
               if [ ! -f "${BUILDROOT_OUT}/.config" ]; then
                 cp "${BUILDROOT_SRC}/.config" "${BUILDROOT_OUT}/.config"
-                # The image's defconfig hard-codes
-                #   BR2_ROOTFS_OVERLAY="/opt/buildroot/modules /opt/buildroot/overlay"
-                # The first path is meant to be populated by *this* job's
-                # kernel modules_install, but /opt/buildroot is baked
-                # read-only into the image and that subdir doesn't even
-                # exist -- target-finalize's rsync died with
+                # The image's defconfig sets
+                #   BR2_ROOTFS_OVERLAY="modules overlay"
+                # which buildroot resolves *relative to its topdir*
+                # /opt/buildroot. The first path is meant to receive this
+                # job's kernel modules, but /opt/buildroot is baked
+                # read-only into the image (a+rX, no a+w) and the modules
+                # subdir doesn't even exist -- target-finalize's rsync
+                # died with
                 #   change_dir "/opt/buildroot/modules" failed: No such file or directory
-                # (build #49). Redirect the modules overlay at a writable
-                # pod-local dir; we populate it from modules_install below
-                # before buildroot's target-finalize phase rsyncs from it.
-                sed -i "s|/opt/buildroot/modules|${BUILDROOT_OUT}/modules|g" "${BUILDROOT_OUT}/.config"
+                # in builds #49 / #50. Rewrite the modules entry as an
+                # absolute path under a writable pod-local dir; we
+                # populate it from modules_install below before
+                # buildroot's target-finalize rsyncs from it. Keep the
+                # second entry pointing at /opt/buildroot/overlay (static
+                # rootfs additions baked into the image).
+                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /opt/buildroot/overlay"|' "${BUILDROOT_OUT}/.config"
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
               JN="$(nproc 2>/dev/null || echo 32)"
