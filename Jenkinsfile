@@ -338,9 +338,15 @@ spec:
             withEnv(['HOME=/home/jenkins/agent']) {
               sh '''
                 set -eu
+                # Jenkins "Username with password" credential fields preserve trailing
+                # whitespace from paste, which Starfleet's /token endpoint rejects byte-
+                # for-byte ("None of requested scopes granted to client in service" with
+                # a single trailing 0x0a sneaks through). Strip CR/LF defensively so a
+                # future credential rotation can't silently break the pipeline.
+                CSEC="$(printf '%s' "${COLOSSUS_CLIENT_SECRET}" | tr -d '\r\n')"
                 colossus login --method ssa \
                   --client-id "${COLOSSUS_CLIENT_ID}" \
-                  --client-secret "${COLOSSUS_CLIENT_SECRET}"
+                  --client-secret "${CSEC}"
                 colossus bm region list >/dev/null
                 echo "Colossus SSA login OK (token cached under ${HOME})"
               '''
