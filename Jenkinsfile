@@ -20,7 +20,13 @@
 //   Avocado runs only on the leased test target (Buildroot initrd), not on this agent.
 // - Buildroot: sources baked into CI image at /opt/buildroot (espeer/buildroot nova-test); NFS holds
 //   /scratch/buildroot-out (make O=...) and /scratch/ccache — safe to delete; outputs regenerate.
-// - Colossus: configure auth the same way as on self-hosted runners (env or credentials).
+// - Colossus auth: Starfleet Service Account (SSA). Add a "Username with password"
+//   Jenkins credential with id "colossus-ssa" -- username = SSA client_id, password =
+//   client_secret. The "Colossus login" stage below runs `colossus login --method ssa`
+//   once per pipeline; the resulting token persists on the nova-ci container's local
+//   FS for the rest of the run (Provision + finally cleanup). Manual `colossus login`
+//   (OIDC/LDAP) is deprecated and will not work non-interactively. Onboarding SOP:
+//   https://confluence.nvidia.com/display/Colossus/SSA+Clients+on-boarding+with+Colossus
 // - CI image default is public GitLab Container Registry (no imagePullSecrets). If the image
 //   becomes private, add a K8s docker-registry pull secret (namespace SA or pod spec) or reintroduce
 //   imagePullSecrets in the pod yaml below.
@@ -305,6 +311,44 @@ spec:
         }
       }
 
+      // Run once per pipeline -- `colossus login` writes its token under $HOME on the
+      // nova-ci container. HOME is pinned to /home/jenkins/agent (see Build stage) which
+      // is shared across every container('nova-ci') block on this pod, so subsequent
+      // Provision / finally calls inherit the auth state without re-logging in.
+      // We pass --client-id / --client-secret via env to keep them off `set -x` traces
+      // and out of process argv (visible in /proc).
+      stageName = 'Colossus login'
+      stage(stageName) {
+        container('nova-ci') {
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+          }
+          withCredentials([usernamePassword(
+            credentialsId: 'colossus-ssa',
+            usernameVariable: 'COLOSSUS_CLIENT_ID',
+            passwordVariable: 'COLOSSUS_CLIENT_SECRET'
+          )]) {
+            // Same HOME pin as Build (and reused by Provision + finally): our NIS uid
+            // 150707 has no /etc/passwd entry so the container's default HOME is "",
+            // which would send `colossus login`'s token cache to "/" and fail.
+            withEnv(['HOME=/home/jenkins/agent']) {
+              sh '''
+                set -eu
+                colossus login --method ssa \
+                  --client-id "${COLOSSUS_CLIENT_ID}" \
+                  --client-secret "${COLOSSUS_CLIENT_SECRET}"
+                colossus bm region list >/dev/null
+                echo "Colossus SSA login OK (token cached under ${HOME})"
+              '''
+            }
+          }
+        }
+      }
+
       stageName = 'Provision'
       stage(stageName) {
         container('nova-ci') {
@@ -319,6 +363,8 @@ spec:
             "ANSIBLE_GIT_URL=${params.ANSIBLE_GIT_URL}",
             "ANSIBLE_GIT_BRANCH=${params.ANSIBLE_GIT_BRANCH}",
             "ANSIBLE_PLAYBOOK=${params.ANSIBLE_PLAYBOOK}",
+            // colossus reads its cached SSA token from $HOME (set in Colossus login).
+            'HOME=/home/jenkins/agent',
           ]) {
             // Shebang on line 1 makes Jenkins's durable-task run this with
             // bash rather than /bin/sh -> dash on Ubuntu 24.04, which the
@@ -533,18 +579,22 @@ spec:
       }
     } finally {
       container('nova-ci') {
-        sh '''
-          set +e
-          if [ -f leases.txt ]; then
-            while IFS= read -r TARGET; do
-              ID=$(echo "${TARGET}" | cut -d, -f1)
-              echo "Rebooting ${ID}..."
-              colossus bm reboot --resource-id "${ID}"
-            done < leases.txt
-            echo "Waiting..."
-            sleep 180
-          fi
-        '''
+        // HOME = where Colossus login cached the SSA token; without it the cleanup
+        // would re-prompt for auth and fail silently (set +e).
+        withEnv(['HOME=/home/jenkins/agent']) {
+          sh '''
+            set +e
+            if [ -f leases.txt ]; then
+              while IFS= read -r TARGET; do
+                ID=$(echo "${TARGET}" | cut -d, -f1)
+                echo "Rebooting ${ID}..."
+                colossus bm reboot --resource-id "${ID}"
+              done < leases.txt
+              echo "Waiting..."
+              sleep 180
+            fi
+          '''
+        }
       }
     }
   }
