@@ -379,22 +379,25 @@ spec:
             // ).
             sh '''#!/bin/bash
               set -euxo pipefail
-              # Capture colossus output verbatim before piping into jq.
-              # Build #53 had jq fail with
-              #   parse error: Invalid numeric literal at line 1, column 9
-              # which means colossus emitted something that isn't the JSON
-              # array we asked for (auth banner / warning leaked onto
-              # stdout, format drift, etc). Dump the raw response so we
-              # can see exactly what came back and what to filter.
-              echo "=== colossus bm lease list -j raw output (first 1KB) ==="
-              colossus bm lease list -j > /tmp/colossus_raw.out 2>&1 || \
-                { echo "colossus exit=$? -- output above"; head -c 4096 /tmp/colossus_raw.out; exit 1; }
-              head -c 1024 /tmp/colossus_raw.out; echo
-              echo "=== end raw output (size: $(wc -c < /tmp/colossus_raw.out) bytes) ==="
 
+              # colossus bm lease list -j returns exit code 1 when the lease
+              # set is empty (like grep -- "no results" treated as failure)
+              # but writes a valid empty JSON array "[]" to stdout. Under
+              # set -eo pipefail this would kill the script the moment we
+              # have zero leases, which is exactly the case on a freshly-
+              # onboarded SSA client. Distinguish "empty result" from "real
+              # error" by validating that stdout parses as a JSON array;
+              # any other output (auth banner, http error, etc) still fails
+              # loudly with the raw output dumped for diagnosis.
               get_leases() {
-                echo "Checking leases..."
-                colossus bm lease list -j | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\\(.entity_details.id),\\(.entity_details.status),\\(.entity_details.ipAddress),\\(.entity_details.leaseJustification)"' | tee leases.txt
+                local raw
+                raw=$(colossus bm lease list -j 2>&1) || true
+                if ! printf '%s' "$raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                  echo 'colossus bm lease list -j produced non-JSON output:' >&2
+                  printf '%s\\n' "$raw" >&2
+                  return 1
+                fi
+                printf '%s' "$raw" | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\\(.entity_details.id),\\(.entity_details.status),\\(.entity_details.ipAddress),\\(.entity_details.leaseJustification)"' | tee leases.txt
               }
               get_leases
               grep -v -f <(cut -d, -f5 leases.txt) target-gpu-arch.txt | xargs -I{} colossus bm lease create -d 7d \\
