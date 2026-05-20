@@ -435,18 +435,31 @@ spec:
           // root@target's authorized_keys). The key is stored as a
           // Jenkins "SSH Username with private key" credential id
           // "nova-ssh-key"; sshUserPrivateKey writes it to a 0600 temp
-          // file and exposes it via $SSH_KEY for the duration of the
-          // block. We pass it explicitly with -i and pin
-          // IdentitiesOnly=yes so ssh doesn't also try whatever else
-          // happens to be in ~/.ssh, and PasswordAuthentication=no so a
-          // misplaced key fails fast instead of hanging on a password
-          // prompt (the legacy nova@om setup, before this credential,
-          // hit exactly that on build #57's interactive retest).
+          // file and exposes it via $SSH_KEY_SRC.
+          //
+          // The catch: the credential file is written by the JNLP
+          // agent process (uid 1000) -- our nova-ci container is a NIS
+          // uid (150707), so 0600 owner-only locks nova-ci out:
+          //   Warning: Identity file **** not accessible: Permission denied.
+          //   root@<ip>: Permission denied (publickey,password).
+          // The two containers share gid 30 (same umask 0002 setup that
+          // already lets nova-ci share /scratch with jnlp), so we open
+          // the cred file group-readable from inside jnlp, then have
+          // nova-ci install -m 0600 a private copy it owns -- a single-
+          // owner mode is what ssh's UNPROTECTED PRIVATE KEY FILE check
+          // wants to see. We pass the key explicitly with -i and pin
+          // IdentitiesOnly=yes so ssh doesn't also try whatever else is
+          // in ~/.ssh, plus PasswordAuthentication=no so a missing key
+          // fails fast (build #59 hit exactly this when target.yml's
+          // nova@om public key had no private side here yet).
           withCredentials([sshUserPrivateKey(
             credentialsId: 'nova-ssh-key',
-            keyFileVariable: 'SSH_KEY',
+            keyFileVariable: 'SSH_KEY_SRC',
             usernameVariable: 'SSH_USER'
           )]) {
+          container('jnlp') {
+            sh 'chmod g+r "${SSH_KEY_SRC}"'
+          }
           withEnv([
             // Same pod-local emptyDir as the Build stage (the rootfs.cpio
             // is produced there; /scratch isn't where it lands). With
@@ -469,6 +482,12 @@ spec:
             set -eux
             printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
             printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
+            # Stage a private (0600, owned by us) copy of the SSH key --
+            # see the comment block above. install -m 0600 on a source we
+            # can read (now g+r) is one syscall away from a key file ssh
+            # will actually accept.
+            install -m 0600 "${SSH_KEY_SRC}" /home/jenkins/agent/ssh-key
+            SSH_KEY=/home/jenkins/agent/ssh-key
             # Build #59 hit "ssh: connect to host 10.46.64.24 port 22:
             # No route to host" -- a dead Ampere host masquerading as a
             # routing problem (verified out-of-band via SSA-authenticated
@@ -522,14 +541,17 @@ spec:
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
-          // Same SSH key as Deploy -- see Deploy stage's comment for
-          // rationale on the nova-ssh-key credential and the -i/
-          // IdentitiesOnly/PasswordAuthentication=no opts.
+          // Same SSH key as Deploy -- see Deploy stage's comment for the
+          // sshUserPrivateKey -> chmod g+r -> install -m 0600 dance
+          // (jnlp owns the cred file 0600; nova-ci is a different uid).
           withCredentials([sshUserPrivateKey(
             credentialsId: 'nova-ssh-key',
-            keyFileVariable: 'SSH_KEY',
+            keyFileVariable: 'SSH_KEY_SRC',
             usernameVariable: 'SSH_USER'
           )]) {
+          container('jnlp') {
+            sh 'chmod g+r "${SSH_KEY_SRC}"'
+          }
           withEnv([
             // ssh needs getpwuid() to resolve our NIS uid; see comment in
             // Deploy stage. /home/jenkins/agent persists across containers
@@ -547,6 +569,8 @@ spec:
                 printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
                 printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
               fi
+              install -m 0600 "${SSH_KEY_SRC}" /home/jenkins/agent/ssh-key
+              SSH_KEY=/home/jenkins/agent/ssh-key
               SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
               while IFS= read -r TARGET; do
                 IP=$(echo "${TARGET}" | cut -d, -f3)
