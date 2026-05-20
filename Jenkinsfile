@@ -66,7 +66,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-14'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-19'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -429,9 +429,22 @@ spec:
             // O=${BUILDROOT_OUT} set explicitly, images/ is a direct
             // child of BUILDROOT_OUT -- no "output/" prefix.
             'BUILDROOT_OUT=/home/jenkins/agent/buildroot-out',
+            // ssh/scp call getpwuid(getuid()) at startup and fatal-exit if
+            // the lookup fails -- our NIS uid 150707 has no /etc/passwd
+            // entry in the container (build #57: "scp: unknown user 150707").
+            // /etc/passwd isn't writable as non-root, so we provide a fake
+            // passwd DB via the libnss_wrapper LD_PRELOAD library written
+            // out below. HOME pin is also required because that's what
+            // ssh advertises as pw_dir.
+            'HOME=/home/jenkins/agent',
+            'LD_PRELOAD=libnss_wrapper.so',
+            'NSS_WRAPPER_PASSWD=/home/jenkins/agent/nss-passwd',
+            'NSS_WRAPPER_GROUP=/home/jenkins/agent/nss-group',
           ]) {
           sh '''
             set -eux
+            printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
+            printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
             SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
             BZIMAGE="${WORKSPACE}/arch/x86_64/boot/bzImage"
             INITRD="${BUILDROOT_OUT}/images/rootfs.cpio"
@@ -461,15 +474,31 @@ spec:
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
-          sh '''
-            set -eux
-            SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
-            while IFS= read -r TARGET; do
-              IP=$(echo "${TARGET}" | cut -d, -f3)
-              GPU_ARCH=$(echo "${TARGET}" | cut -d, -f5)
-              ssh -n ${SSH_OPTS} "root@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a "${GPU_ARCH}.tap"
-            done < leases.txt
-          '''
+          withEnv([
+            // ssh needs getpwuid() to resolve our NIS uid; see comment in
+            // Deploy stage. /home/jenkins/agent persists across containers
+            // in the same pod, so the nss-passwd file written by Deploy is
+            // still here -- but write it again defensively in case Deploy
+            // was skipped or the pod recycled between stages.
+            'HOME=/home/jenkins/agent',
+            'LD_PRELOAD=libnss_wrapper.so',
+            'NSS_WRAPPER_PASSWD=/home/jenkins/agent/nss-passwd',
+            'NSS_WRAPPER_GROUP=/home/jenkins/agent/nss-group',
+          ]) {
+            sh '''
+              set -eux
+              if [ ! -f "${NSS_WRAPPER_PASSWD}" ]; then
+                printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
+                printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
+              fi
+              SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+              while IFS= read -r TARGET; do
+                IP=$(echo "${TARGET}" | cut -d, -f3)
+                GPU_ARCH=$(echo "${TARGET}" | cut -d, -f5)
+                ssh -n ${SSH_OPTS} "root@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a "${GPU_ARCH}.tap"
+              done < leases.txt
+            '''
+          }
         }
       }
 

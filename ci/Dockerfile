@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     gawk \
     openssh-client \
+    libnss-wrapper \
     python3 \
     binutils \
     time \
