@@ -389,6 +389,15 @@ spec:
               # error" by validating that stdout parses as a JSON array;
               # any other output (auth banner, http error, etc) still fails
               # loudly with the raw output dumped for diagnosis.
+              #
+              # The final awk filter narrows leases.txt to architectures
+              # listed in target-gpu-arch.txt -- this lets us "temporarily
+              # drop" a flaky arch (e.g. the Z370-A Ampere host that does
+              # not come back reliably from `bm reboot`) by removing its
+              # line from target-gpu-arch.txt, without releasing the
+              # underlying colossus lease. Excluded leases also are not
+              # touched by the Cleanup stage's reboot loop, so we stop
+              # perturbing a host we are not actually using.
               get_leases() {
                 local raw
                 raw=$(colossus bm lease list -j 2>&1) || true
@@ -397,7 +406,10 @@ spec:
                   printf '%s\\n' "$raw" >&2
                   return 1
                 fi
-                printf '%s' "$raw" | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\\(.entity_details.id),\\(.entity_details.status),\\(.entity_details.ipAddress),\\(.entity_details.leaseJustification)"' | tee leases.txt
+                printf '%s' "$raw" \\
+                  | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\\(.entity_details.id),\\(.entity_details.status),\\(.entity_details.ipAddress),\\(.entity_details.leaseJustification)"' \\
+                  | awk -F, 'NR==FNR{want[$1]=1; next} $5 in want' target-gpu-arch.txt - \\
+                  | tee leases.txt
               }
               get_leases
               # `grep -v` returns 1 when no lines match -- i.e. when all
