@@ -400,7 +400,14 @@ spec:
                 printf '%s' "$raw" | jq -r '.[] | select(.entity_details.leaseJustification // "" | contains("Nova CI/CD")) | "\\(.entity_details.id),\\(.entity_details.status),\\(.entity_details.ipAddress),\\(.entity_details.leaseJustification)"' | tee leases.txt
               }
               get_leases
-              grep -v -f <(cut -d, -f5 leases.txt) target-gpu-arch.txt | xargs -I{} colossus bm lease create -d 7d \\
+              # `grep -v` returns 1 when no lines match -- i.e. when all
+              # required arches already have RESERVED leases (the normal
+              # steady state when an earlier build left active 7d leases
+              # behind). Under pipefail that propagates as the pipeline
+              # exit and kills the script (build #58). Tolerate empty
+              # output with || true, and tell xargs not to run colossus
+              # at all on empty input via -r.
+              { grep -v -f <(cut -d, -f5 leases.txt) target-gpu-arch.txt || true; } | xargs -r -I{} colossus bm lease create -d 7d \\
                 -agb "${ANSIBLE_GIT_BRANCH}" -agu "${ANSIBLE_GIT_URL}" -apb "${ANSIBLE_PLAYBOOK}" \\
                 -lj "Nova CI/CD,{}" -o ubuntu-25.10-x86_64-standard-uefi \\
                 -f "gpus.architecture={}" "cpus.sockets.arch=x86_64"
