@@ -452,6 +452,33 @@ spec:
             set -eux
             printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
             printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
+            # Build #59 hit "ssh: connect to host 10.46.64.24 port 22:
+            # No route to host" -- L3 EHOSTUNREACH before ssh ever sent
+            # any bytes. The legacy GitHub Actions workflow ran on a
+            # self-hosted runner on the corporate net; the Blossom k8s
+            # pod may have different egress / routing. Dump the pod's
+            # view of the world so we know whether this is "no route at
+            # all", "this subnet only", or "transient host down".
+            # Image doesn't have iproute2 or netcat -- read routes from
+            # /proc directly and probe TCP via bash's /dev/tcp builtin
+            # (spawned through `bash -c` so we don't depend on the outer
+            # sh being bash).
+            echo "==== Deploy connectivity diagnostics ===="
+            echo "---- /proc/net/route ----"
+            cat /proc/net/route || true
+            echo "---- /etc/resolv.conf ----"
+            cat /etc/resolv.conf || true
+            echo "---- per-lease reachability (TCP 22, 5s timeout) ----"
+            while IFS= read -r TARGET; do
+              IP=$(echo "${TARGET}" | cut -d, -f3)
+              ARCH=$(echo "${TARGET}" | cut -d, -f5)
+              if timeout 5 bash -c "exec 3<>/dev/tcp/${IP}/22 && exec 3>&-" 2>&1; then
+                echo "${ARCH} @ ${IP}:22 -- reachable"
+              else
+                echo "${ARCH} @ ${IP}:22 -- UNREACHABLE (exit $?)"
+              fi
+            done < leases.txt
+            echo "==== end diagnostics ===="
             SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
             BZIMAGE="${WORKSPACE}/arch/x86_64/boot/bzImage"
             INITRD="${BUILDROOT_OUT}/images/rootfs.cpio"
