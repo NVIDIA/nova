@@ -1,3 +1,2 @@
-Ampere
 Blackwell
 Turing
