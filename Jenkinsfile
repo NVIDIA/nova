@@ -430,6 +430,23 @@ spec:
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
+          // ssh into the leased target hosts using the `nova@om` private
+          // key (matches the ed25519 public key target.yml installs into
+          // root@target's authorized_keys). The key is stored as a
+          // Jenkins "SSH Username with private key" credential id
+          // "nova-ssh-key"; sshUserPrivateKey writes it to a 0600 temp
+          // file and exposes it via $SSH_KEY for the duration of the
+          // block. We pass it explicitly with -i and pin
+          // IdentitiesOnly=yes so ssh doesn't also try whatever else
+          // happens to be in ~/.ssh, and PasswordAuthentication=no so a
+          // misplaced key fails fast instead of hanging on a password
+          // prompt (the legacy nova@om setup, before this credential,
+          // hit exactly that on build #57's interactive retest).
+          withCredentials([sshUserPrivateKey(
+            credentialsId: 'nova-ssh-key',
+            keyFileVariable: 'SSH_KEY',
+            usernameVariable: 'SSH_USER'
+          )]) {
           withEnv([
             // Same pod-local emptyDir as the Build stage (the rootfs.cpio
             // is produced there; /scratch isn't where it lands). With
@@ -453,16 +470,12 @@ spec:
             printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
             printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
             # Build #59 hit "ssh: connect to host 10.46.64.24 port 22:
-            # No route to host" -- L3 EHOSTUNREACH before ssh ever sent
-            # any bytes. The legacy GitHub Actions workflow ran on a
-            # self-hosted runner on the corporate net; the Blossom k8s
-            # pod may have different egress / routing. Dump the pod's
-            # view of the world so we know whether this is "no route at
-            # all", "this subnet only", or "transient host down".
-            # Image doesn't have iproute2 or netcat -- read routes from
-            # /proc directly and probe TCP via bash's /dev/tcp builtin
-            # (spawned through `bash -c` so we don't depend on the outer
-            # sh being bash).
+            # No route to host" -- a dead Ampere host masquerading as a
+            # routing problem (verified out-of-band via SSA-authenticated
+            # ping/colossus bm host coldreboot/reprovision on 2026-05-20).
+            # Keep the diagnostic in tree so future flakes surface
+            # cheaply: /proc/net/route + per-lease TCP/22 probes via the
+            # bash /dev/tcp builtin (image lacks iproute2 and netcat).
             echo "==== Deploy connectivity diagnostics ===="
             echo "---- /proc/net/route ----"
             cat /proc/net/route || true
@@ -479,21 +492,22 @@ spec:
               fi
             done < leases.txt
             echo "==== end diagnostics ===="
-            SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
+            SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
             BZIMAGE="${WORKSPACE}/arch/x86_64/boot/bzImage"
             INITRD="${BUILDROOT_OUT}/images/rootfs.cpio"
             while IFS= read -r TARGET; do
               IP=$(echo "${TARGET}" | cut -d, -f3)
-              scp ${SSH_OPTS} "${BZIMAGE}" "root@${IP}:/"
-              scp ${SSH_OPTS} "${INITRD}" "root@${IP}:/"
+              scp ${SSH_OPTS} "${BZIMAGE}" "${SSH_USER}@${IP}:/"
+              scp ${SSH_OPTS} "${INITRD}" "${SSH_USER}@${IP}:/"
               echo "Loading kexec kernel on ${IP}..."
-              ssh -n ${SSH_OPTS} "root@${IP}" 'kexec -l /bzImage --initrd=/rootfs.cpio --append="ignore_loglevel console=ttyS1,115200n8"'
+              ssh -n ${SSH_OPTS} "${SSH_USER}@${IP}" 'kexec -l /bzImage --initrd=/rootfs.cpio --append="ignore_loglevel console=ttyS1,115200n8"'
               echo "Booting kernel..."
-              ssh -n ${SSH_OPTS} "root@${IP}" "kexec -e" || true
+              ssh -n ${SSH_OPTS} "${SSH_USER}@${IP}" "kexec -e" || true
             done < leases.txt
             echo "Waiting for boot to complete..."
             sleep 30
           '''
+          }
           }
         }
       }
@@ -508,6 +522,14 @@ spec:
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
           }
+          // Same SSH key as Deploy -- see Deploy stage's comment for
+          // rationale on the nova-ssh-key credential and the -i/
+          // IdentitiesOnly/PasswordAuthentication=no opts.
+          withCredentials([sshUserPrivateKey(
+            credentialsId: 'nova-ssh-key',
+            keyFileVariable: 'SSH_KEY',
+            usernameVariable: 'SSH_USER'
+          )]) {
           withEnv([
             // ssh needs getpwuid() to resolve our NIS uid; see comment in
             // Deploy stage. /home/jenkins/agent persists across containers
@@ -525,13 +547,14 @@ spec:
                 printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
                 printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
               fi
-              SSH_OPTS="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+              SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
               while IFS= read -r TARGET; do
                 IP=$(echo "${TARGET}" | cut -d, -f3)
                 GPU_ARCH=$(echo "${TARGET}" | cut -d, -f5)
-                ssh -n ${SSH_OPTS} "root@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a "${GPU_ARCH}.tap"
+                ssh -n ${SSH_OPTS} "${SSH_USER}@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a "${GPU_ARCH}.tap"
               done < leases.txt
             '''
+          }
           }
         }
       }
