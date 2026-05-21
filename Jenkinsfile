@@ -265,6 +265,16 @@ spec:
             sh '''
               set -eux
               mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}" "${BR2_DL_DIR}" "${BUILDROOT_OUT}/modules"
+              # /scratch/buildroot/overlay is required by BR2_ROOTFS_OVERLAY
+              # below. Fail fast (with the actual path) if it's missing
+              # or empty -- silently building a rootfs without
+              # /root/.ssh/authorized_keys regresses us back to build
+              # #64's empty-TAP false-pass: ssh "Permission denied"
+              # at the post-kexec sshd, no avocado output, Status's
+              # grep "^not ok" matches zero lines -> "All tests PASSED!".
+              NFS_OVERLAY=/scratch/buildroot/overlay
+              test -f "${NFS_OVERLAY}/root/.ssh/authorized_keys" \
+                || { echo "FAIL: ${NFS_OVERLAY}/root/.ssh/authorized_keys missing -- re-extract overlay.txz onto NFS" >&2; exit 1; }
               export KBUILD_BUILD_TIMESTAMP=''
               if [ ! -f "${BUILDROOT_OUT}/.config" ]; then
                 cp "${BUILDROOT_SRC}/.config" "${BUILDROOT_OUT}/.config"
@@ -279,10 +289,22 @@ spec:
                 # the "modules" path with no source dir tripped #49/#50,
                 # and after sending modules elsewhere, the still-missing
                 # "overlay" path then tripped #52 with the same error.
-                # Rewrite the overlay list down to a single absolute
-                # entry pointing at a writable pod-local dir where we
-                # deposit kernel modules via modules_install below.
-                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules"|' "${BUILDROOT_OUT}/.config"
+                # Rewrite the overlay list to two absolute paths:
+                #   - ${BUILDROOT_OUT}/modules   (pod-local; populated by
+                #     `modules_install` below)
+                #   - /scratch/buildroot/overlay (NFS; ~100 MB of GPU
+                #     firmware + /root/.ssh/authorized_keys for nova@om
+                #     + /root/driver-load-test.sh + /root/tests.json +
+                #     /etc/resolv.conf -- the contents that used to live
+                #     in espeer/buildroot's overlay/. Extracted once
+                #     from overlay.txz; updates require a re-extract).
+                #     Build #64 was a false-pass because this overlay
+                #     was missing: post-kexec sshd had no root-key
+                #     authorized, ssh's "Permission denied" went to
+                #     stderr (not captured by tee), TAP files were
+                #     empty, and Status's grep "^not ok" matched
+                #     nothing -> "All tests PASSED!".
+                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /scratch/buildroot/overlay"|' "${BUILDROOT_OUT}/.config"
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
               JN="$(nproc 2>/dev/null || echo 32)"
@@ -611,7 +633,20 @@ spec:
               while IFS= read -r TARGET; do
                 IP=$(echo "${TARGET}" | cut -d, -f3)
                 GPU_ARCH=$(echo "${TARGET}" | cut -d, -f5)
-                ssh -n ${SSH_OPTS} "${SSH_USER}@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" | tee -a "${GPU_ARCH}.tap"
+                # 2>&1 is load-bearing: ssh transport errors ("Permission
+                # denied", "No route to host", kexec hang) print on stderr,
+                # which the original `... | tee -a` did not capture. Build
+                # #64 silently passed because the ssh failed at auth time,
+                # tee saw nothing on stdout, the .tap files were empty,
+                # and Status's grep "^not ok" matched zero lines -> green.
+                # Folding stderr into the TAP stream gives the Status
+                # stage's stricter check (below) actual content to flunk
+                # on, and leaves a paper trail in the PR-comment summary.
+                # Note: we intentionally do NOT set -o pipefail here --
+                # avocado exits non-zero when individual tests fail but
+                # still produces valid TAP, and we want every leased host
+                # to run even if one fails.
+                ssh -n ${SSH_OPTS} "${SSH_USER}@${IP}" "journalctl && avocado run /root/driver-load-test.sh --tap -" 2>&1 | tee -a "${GPU_ARCH}.tap"
               done < leases.txt
             '''
           }
@@ -685,8 +720,28 @@ spec:
       stage(stageName) {
         container('nova-ci') {
           sh '''
-            set -eux
-            if cat *.tap | grep "^not ok"; then
+            set -eu
+            if ! ls *.tap >/dev/null 2>&1; then
+              echo "FAIL: Test stage produced no TAP files at all." >&2
+              exit 1
+            fi
+            # A successful avocado run prints at least one "ok " or
+            # "not ok " line per test. If we got none, the ssh layer
+            # never managed to invoke avocado (auth failure, dead host,
+            # kexec didn't come up, ...) -- treat that as a failure
+            # rather than the pre-#64 behaviour of "no lines matched
+            # grep '^not ok' -> All tests PASSED!". Dump the raw .tap
+            # contents to stderr so the false-pass cause is visible
+            # straight in the Status step log.
+            if ! grep -hE "^(ok|not ok) " *.tap >/dev/null 2>&1; then
+              echo "FAIL: TAP files contain no ok/not-ok lines -- avocado never ran on any leased host." >&2
+              for f in *.tap; do
+                echo "==== ${f} ====" >&2
+                cat "${f}" >&2
+              done
+              exit 1
+            fi
+            if grep -h "^not ok " *.tap; then
               exit 1
             fi
             echo "All tests PASSED!"
