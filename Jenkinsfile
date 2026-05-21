@@ -657,20 +657,28 @@ spec:
       stageName = 'Summarize'
       stage(stageName) {
         container('nova-ci') {
+          // No `set -x` here: shell trace ("+ cat tap-summary.md") was
+          // interleaving with the actual summary table and making the
+          // Jenkins console output unreadable (build #64 feedback).
+          // Echo the section banners explicitly instead.
           sh '''
-            set -eux
+            set -eu
             if ! ls *.tap >/dev/null 2>&1; then
-              echo "No TAP files found"
+              echo "No TAP files found" >&2
               exit 1
             fi
             SUMMARY_AWK=/usr/local/share/nova-ci/tap-summary.gawk
             test -r "${SUMMARY_AWK}"
             command -v gawk >/dev/null 2>&1 || { echo "gawk (GNU awk) required in CI_IMAGE; see ci/Dockerfile" >&2; exit 1; }
             gawk --file "${SUMMARY_AWK}" --sandbox -- *.tap > "${WORKSPACE}/tap-summary.md"
-            echo "---- TAP summary (Markdown) ----"
+            printf '\n==================== TAP summary (Markdown) ====================\n\n'
             cat "${WORKSPACE}/tap-summary.md"
-            echo "---- raw TAP files ----"
-            for f in *.tap; do echo "==== ${f} ===="; cat "${f}"; done
+            printf '\n==================== Raw TAP files ====================\n'
+            for f in *.tap; do
+              printf '\n-------------------- %s --------------------\n' "${f}"
+              cat "${f}"
+            done
+            printf '\n'
           '''
         }
       }
@@ -698,9 +706,23 @@ spec:
                     echo "jq not found; skipping PR comment" >&2
                     exit 1
                   fi
-                  PREFIX=$(printf '%s\n\n' "[nova-ci] TAP summary — build ${BUILD_NUMBER} — ${BUILD_URL}")
-                  jq -n --arg prefix "${PREFIX}" --rawfile t "${WORKSPACE}/tap-summary.md" \
-                    '{body: ($prefix + $t)}' > "${WORKSPACE}/pr-comment.json"
+                  # Build the comment body with jq so embedded newlines
+                  # don't need backslash-escaping. The prior
+                  #   PREFIX=$(printf '...\\n\\n' "...")
+                  #   jq ... --arg prefix "${PREFIX}" ... '{body: ($prefix + $t)}'
+                  # form lost its trailing newlines to $(...) (which
+                  # strips them), so the prefix line rendered jammed
+                  # onto the table's first row in build #64's PR
+                  # comment. Pass the prefix as a single line and
+                  # splice in the blank line inside jq instead, where
+                  # it survives the JSON encoding intact. The
+                  # [console](url) link makes the bare BUILD_URL
+                  # render as a click target in GitHub Markdown
+                  # rather than just inline text.
+                  jq -n \
+                    --arg prefix "[nova-ci] TAP summary — build #${BUILD_NUMBER} ([console](${BUILD_URL}))" \
+                    --rawfile t "${WORKSPACE}/tap-summary.md" \
+                    '{body: ($prefix + "\\n\\n" + $t)}' > "${WORKSPACE}/pr-comment.json"
                   curl -fsS -X POST \
                     -H "Accept: application/vnd.github+json" \
                     -H "Authorization: token ${GIT_PASSWORD}" \
