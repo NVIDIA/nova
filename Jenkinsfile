@@ -66,7 +66,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-19'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-21'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -307,6 +307,18 @@ spec:
                 sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /scratch/buildroot/overlay"|' "${BUILDROOT_OUT}/.config"
                 make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               fi
+              # Fail-fast on a broken Rust toolchain. CONFIG_NOVA_CORE
+              # and CONFIG_DRM_NOVA `depends on RUST`, so if kbuild's
+              # scripts/rust_is_available.sh test fails, kconfig
+              # SILENTLY flips CONFIG_RUST to n, hides both symbols
+              # from the .config, and the build happily produces a
+              # kernel with no nova modules at all (build #65: no
+              # nova.ko, no nova-core.ko, "not ok" with no driver-load
+              # lines in dmesg). `make rustavailable` runs the same
+              # script kconfig uses, so a missing bindgen / wrong
+              # rustc version / clang/libclang mismatch trips us here
+              # in seconds rather than 4 stages later.
+              make rustavailable LLVM=1
               JN="$(nproc 2>/dev/null || echo 32)"
               # Buildroot's host-tools build (notably the host-cmake stage)
               # spawns big cc1plus translation units; at -j$(nproc)=128 peak

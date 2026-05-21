@@ -154,12 +154,17 @@ echo "==> docker build --platform ${PLATFORM} -t ${IMAGE}"
   -t "${IMAGE}" \
   "${BUILD_CTX}"
 
-echo "==> smoke check (time, clang, ccache, colossus on PATH)"
+echo "==> smoke check (time, clang, ccache, rustc, bindgen, colossus on PATH)"
 "${DOCKER}" run --rm --platform "${PLATFORM}" "${IMAGE}" sh -c '
   set -e
   /usr/bin/time --version 2>&1 | head -1
   clang --version | head -1
   ccache --version | head -1
+  # rustc + bindgen are required for kbuild Rust support; without bindgen,
+  # CONFIG_RUST flips to n at silentoldconfig time and CONFIG_NOVA_CORE /
+  # CONFIG_DRM_NOVA disappear from the .config silently (build #65).
+  rustc --version
+  bindgen --version
   if command -v colossus >/dev/null 2>&1; then
     echo "colossus: $(ls -la "$(command -v colossus)")"
   else

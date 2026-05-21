@@ -71,11 +71,23 @@ RUN mkdir -p /usr/local/share/nova-ci \
     && chmod a+r /usr/local/share/nova-ci/tap-summary.gawk
 
 # Rust (Rust for Linux): install under /opt so any runAsUser can read/execute.
+# bindgen-cli is the *separate* host-side binary that kbuild's
+# scripts/rust_is_available.sh probes via `bindgen --version`. Without
+# it, that script exits non-zero, `make rustavailable` returns failure,
+# and kconfig silently flips CONFIG_RUST to n -- which in turn hides
+# every `depends on RUST` symbol (CONFIG_NOVA_CORE, CONFIG_DRM_NOVA, ...).
+# Build #65 reproduced this exactly: nova.ko/nova-core.ko were never
+# emitted, modules_install completed with no nova modules, and the
+# kexec'd target had no driver to load. Pinned to "latest" per user
+# direction -- accept that a future bindgen API break may require a
+# version-pin retrofit (see scripts/min-tool-version.sh bindgen for
+# the kernel-required lower bound).
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y \
       --no-modify-path \
       --default-toolchain none \
     && "${CARGO_HOME}/bin/rustup" toolchain install nightly -c rust-src -c rustfmt -c clippy \
     && "${CARGO_HOME}/bin/rustup" default nightly \
+    && "${CARGO_HOME}/bin/cargo" install --locked bindgen-cli \
     && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"
 
 ENV PATH="${CARGO_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
