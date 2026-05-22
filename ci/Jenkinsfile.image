@@ -1,0 +1,233 @@
+// Nova CI image build pipeline -- Blossom Jenkins job `nova-ci-image`.
+//
+// Rebuilds gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci, the
+// agent image that nova-cicd (ci/Jenkinsfile in this repo... well, the
+// top-level Jenkinsfile) pulls for every /build run. The image bakes in a
+// full buildroot tree + the static rootfs overlay; rebuilding it locally on
+// Apple Silicon via QEMU isn't viable (linux-headers' headers_install
+// `__sub-make` hits a GNU-make jobserver inheritance bug under QEMU x86-on-
+// ARM and never finishes), so the build runs here on a real x86 Blossom node
+// using kaniko -- no QEMU, no jobserver pathology.
+//
+// Trigger model: manual only ("Build with Parameters" in the Jenkins UI).
+// There is intentionally NO GitHub event integration:
+//   - A Generic Webhook Trigger doesn't work because the NVIDIA/nova GitHub
+//     webhook is owned by the central Blossom GHA runner; it doesn't fan
+//     out to per-job webhook URLs on prod.blsm.nvidia.com.
+//   - Going through GHA (.github/workflows/blossom-ci.yml) doesn't work
+//     either: Blossom cross-checks the workflow contents against an
+//     expected template, and START-CI-JOB is hard-wired to a single
+//     Jenkins job per repo (nova-cicd), so we can't route /build-image to
+//     a different job from there.
+// The image gets rebuilt rarely enough that "click Build, paste new tag
+// into Jenkinsfile" is fine. If you want to automate the tag bump later,
+// have nova-cicd read the latest successful nova-ci-image build via the
+// Jenkins API and use *that* tag for `ciImage` -- avoids the manual edit
+// loop without needing any GitHub-side wiring.
+//
+// Prerequisites (one-time, set up in the Blossom credentials UI):
+// - github-token         (Username with password) -- shared with nova-cicd;
+//                          used to clone the NVIDIA/nova repo for the build
+//                          context (the .git history of `ci/` is the input).
+// - artifactory-token    (Username with password) -- ARTIFACTORY_USER +
+//                          ARTIFACTORY_TOKEN for the colossus tarball
+//                          download from artifactory.nvidia.com (build-
+//                          image.sh fetches the latest colossus_cli release
+//                          and bakes it into the image's private layer).
+// - gitlab_epeer         (Username with password) -- shared with the
+//                          blossom-github-lib SCM clone; doubles as registry
+//                          auth for `gitlab-master.nvidia.com:5005`. The
+//                          PAT in the password field must have
+//                          `read_registry` + `write_registry` scopes (not
+//                          just `read_repository`) -- kaniko needs to push.
+//                          Generate at https://gitlab-master.nvidia.com/-/
+//                          user_settings/personal_access_tokens if your
+//                          existing one lacks the registry scopes.
+//
+// Output: pushes
+//   gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:<YYYY-MM-DD>-<short-sha>
+// to the registry. The final console line is the bare image reference, so
+// you can copy/paste it into Jenkinsfile's `ciImage =` line and push.
+
+properties([
+  parameters([
+    string(name: 'BRANCH',
+           defaultValue: 'nova-test',
+           description: 'Branch of NVIDIA/nova to build the image from. The image SHA tag is derived from this checkout, so this is what determines which ci/ tree gets baked in.'),
+    string(name: 'KANIKO_IMAGE',
+           defaultValue: 'gcr.io/kaniko-project/executor:v1.23.0-debug',
+           description: 'kaniko executor image. The "-debug" variant ships /busybox/sh, which jenkins-agent execs into; the plain variant is scratch and will fail to start.'),
+  ])
+])
+
+def branch = params.BRANCH?.trim()
+def kanikoImage = params.KANIKO_IMAGE?.trim()
+if (!branch) {
+  error('BRANCH parameter must be set (default: nova-test).')
+}
+if (!kanikoImage) {
+  error('KANIKO_IMAGE parameter must be set.')
+}
+
+podTemplate(
+  cloud: 'sc-ipp-blossom-prod',
+  yaml: """
+apiVersion: v1
+kind: Pod
+spec:
+  nodeSelector:
+    kubernetes.io/os: "linux"
+  containers:
+  - name: jnlp
+    command: ["/bin/sh", "-c"]
+    args: ["umask 0002 && exec /usr/local/bin/jenkins-agent"]
+    securityContext:
+      runAsGroup: 30
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+  - name: kaniko
+    # kaniko's debug variant has /busybox/sh + busybox utilities, which
+    # jenkins-agent needs to exec into the container for `container('kaniko') { sh ... }`.
+    # The plain executor image is scratch -- no shell, jenkins-agent crashes.
+    command: ["sleep", "infinity"]
+    tty: true
+    # kaniko writes to /kaniko/ (config.json, .build-args, cache) and unpacks
+    # base images into /; running as root is the path of least resistance and
+    # is what every published kaniko-in-Jenkins example does.
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+    resources:
+      # Mirror nova-cicd's shape: the buildroot pre-build inside this image
+      # is the same workload the test pipeline's Build stage used to run
+      # cold, and benefits from the same memory headroom (build #46 OOM-
+      # killed cc1plus during host-cmake bootstrap at smaller limits).
+      requests:
+        memory: 16Gi
+        cpu: "8"
+      limits:
+        memory: 64Gi
+        cpu: "64"
+""",
+  containers: [
+    containerTemplate(
+      name: 'kaniko',
+      image: kanikoImage,
+      ttyEnabled: true,
+      command: 'sleep',
+      args: 'infinity'
+    )
+  ]
+) {
+  node(POD_LABEL) {
+    String imageTag = ''
+    String imageFull = ''
+    String shortSha = ''
+
+    stage('Code checkout') {
+      checkout changelog: true, poll: false, scm: [
+        $class: 'GitSCM',
+        branches: [[name: "refs/remotes/origin/${branch}"]],
+        extensions: [
+          [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, timeout: 30],
+        ],
+        userRemoteConfigs: [[
+          credentialsId: 'github-token',
+          url: 'https://github.com/NVIDIA/nova.git',
+          refspec: "+refs/heads/${branch}:refs/remotes/origin/${branch}",
+        ]]
+      ]
+      shortSha = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+      imageTag = "${new Date().format('yyyy-MM-dd')}-${shortSha}"
+      imageFull = "gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:${imageTag}"
+      currentBuild.description = "${branch}@${shortSha} -> ${imageTag}"
+      echo "DIAG: branch=${branch} shortSha=${shortSha} imageTag=${imageTag}"
+    }
+
+    try {
+      stage('Stage build context') {
+        container('jnlp') {
+          // colossus tarball comes from JFrog Artifactory; build-image.sh
+          // does the download + version resolution. We pass our SSA-equivalent
+          // identity token via the `artifactory-token` credential.
+          withCredentials([usernamePassword(
+            credentialsId: 'artifactory-token',
+            usernameVariable: 'ARTIFACTORY_USER',
+            passwordVariable: 'ARTIFACTORY_TOKEN'
+          )]) {
+            // Stage into a path inside the shared /home/jenkins/agent volume
+            // so the kaniko container can read the same files. The kaniko
+            // container runs uid 0, so file modes only need world-read.
+            sh """
+              set -eux
+              rm -rf /home/jenkins/agent/ctx
+              ci/build-image.sh --stage-only /home/jenkins/agent/ctx --tag "${imageTag}"
+              ls -la /home/jenkins/agent/ctx
+            """
+          }
+        }
+      }
+
+      stage('Kaniko build + push') {
+        container('kaniko') {
+          // Reuse the gitlab_epeer username+PAT credential the
+          // blossom-github-lib SCM clone uses, rather than maintaining a
+          // separate Secret-file copy of ~/.docker/config.json. PAT must
+          // have read_registry + write_registry scopes.
+          withCredentials([usernamePassword(
+            credentialsId: 'gitlab_epeer',
+            usernameVariable: 'GITLAB_USER',
+            passwordVariable: 'GITLAB_TOKEN'
+          )]) {
+            // Synthesize /kaniko/.docker/config.json at runtime. kaniko
+            // reads that file for registry auth; the username:password
+            // pair gets base64-encoded into the `auth` field, exactly
+            // like `docker login` would write it. `set +x` around the
+            // base64 step keeps the PAT out of the log even though
+            // withCredentials masks \$GITLAB_TOKEN -- the masking is
+            // string-substitution and could miss the base64 encoding.
+            sh """#!/busybox/sh
+              set -eu
+              mkdir -p /kaniko/.docker
+              {
+                set +x
+                AUTH_B64=\$(printf '%s:%s' "\$GITLAB_USER" "\$GITLAB_TOKEN" | base64 | tr -d '\\n')
+                printf '{"auths":{"gitlab-master.nvidia.com:5005":{"auth":"%s"}}}\\n' "\$AUTH_B64" > /kaniko/.docker/config.json
+              } 2>/dev/null
+              chmod 0600 /kaniko/.docker/config.json
+              set -x
+              /kaniko/executor \\
+                --context=dir:///home/jenkins/agent/ctx \\
+                --dockerfile=/home/jenkins/agent/ctx/Dockerfile \\
+                --destination="${imageFull}" \\
+                --snapshot-mode=redo \\
+                --use-new-run \\
+                --cleanup \\
+                --verbosity=info
+            """
+          }
+        }
+      }
+
+      // Final, easy-to-grep summary. The bare image reference is on its own
+      // line so a `tail -1` of the console (or just eyeballing) gets it
+      // cleanly for pasting into Jenkinsfile's `ciImage =`.
+      echo "================================================================"
+      echo "nova-ci-image: pushed ${imageFull}"
+      echo "nova-ci-image: bump Jenkinsfile ciImage to :${imageTag}"
+      echo "================================================================"
+      echo "${imageFull}"
+    } finally {
+      // Best-effort cleanup of the staging dir. The pod's writable layer
+      // gets torn down at the end of the run anyway, so this is mostly to
+      // keep `df` honest if the pod is recycled across runs.
+      container('jnlp') {
+        sh 'rm -rf /home/jenkins/agent/ctx || true'
+      }
+    }
+  }
+}
