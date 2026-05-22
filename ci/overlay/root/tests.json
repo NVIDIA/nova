@@ -1,0 +1,5 @@
+[
+	{ "kind": "exec-test",
+          "uri": "journalctl | grep NovaCore | grep NVIDIA | grep Chipset",
+	  "identifier": "driver-load-test" }
+]

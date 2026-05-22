@@ -1,0 +1,5 @@
+# The kernel's root .gitignore excludes all dotfiles (.*), which would also
+# hide ci/overlay/root/.ssh/. Re-include the SSH overlay subtree so the
+# nova@om authorized_keys is tracked alongside the rest of the rootfs overlay.
+!overlay/root/.ssh/
+!overlay/root/.ssh/**
