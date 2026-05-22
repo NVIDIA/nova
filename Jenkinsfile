@@ -10,7 +10,7 @@
 // - Global Pipeline Library: blossom-github-lib (blossom-github-jenkins-lib on GitLab)
 // - Credential id "github-token" (PAT in password field)
 // - Generic Webhook Trigger: post param githubData = JSONPath "$"
-// - Shared scratch on NFS (ccache + ephemeral Buildroot O= output): follow Blossom how-to (NIS uid/gid + nfs volume):
+// - Shared scratch on NFS (ccache only): follow Blossom how-to (NIS uid/gid + nfs volume):
 //   https://nvidia.atlassian.net/wiki/spaces/BLOS/pages/2147264305/NFS+scratch+space+for+Blossom+Jenkins+job
 //   Export: ipp1-cdot01-col01:/vol/scratch1/scratch.epeer_blossom → mountPath /scratch
 //   Set job parameters RUN_AS_UID / RUN_AS_GID from `id` on a Linux host (same as wiki Step 3–4).
@@ -18,8 +18,12 @@
 // - CI image: see ci/Dockerfile — clang/llvm, ccache, make, git, colossus CLI (add in private layer),
 //   jq, curl, openssh-client, Rust-for-Linux (rustup nightly + rust-src / rustfmt / clippy), etc.
 //   Avocado runs only on the leased test target (Buildroot initrd), not on this agent.
-// - Buildroot: sources baked into CI image at /opt/buildroot (espeer/buildroot nova-test); NFS holds
-//   /scratch/buildroot-out (make O=...) and /scratch/ccache — safe to delete; outputs regenerate.
+// - Buildroot: upstream sources at /opt/buildroot (pinned tag, see ci/Dockerfile) + the .config from
+//   ci/buildroot.config baked into the image; the full build is pre-staged at /opt/buildroot-out so
+//   per-CI runs only install freshly-built kernel modules into /opt/buildroot-out/modules/ and let
+//   buildroot repack rootfs.cpio. The static rootfs overlay (firmware, ssh keys, test scripts) lives
+//   at ci/overlay/ in this repo and is baked into /opt/nova-overlay at image build time, so NFS is
+//   no longer touched during Build. Only ccache (/scratch/ccache) still lives on NFS.
 // - Colossus auth: Starfleet Service Account (SSA). Add a "Username with password"
 //   Jenkins credential with id "colossus-ssa" -- username = SSA client_id, password =
 //   client_secret. The "Colossus login" stage below runs `colossus login --method ssa`
@@ -66,7 +70,7 @@ properties([
 // Jenkinsfile, so bumping the tag with a parameter required a manual "Build
 // with Parameters" round-trip every time. Keep this as a plain script var so
 // every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-21'
+def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-22-d62390752'
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -227,14 +231,6 @@ spec:
             // issue here. Cross-pod cache hits are worth the extra latency.
             'CCACHE_DIR=/scratch/ccache',
             'CCACHE_MAXSIZE=50G',
-            // Buildroot's target-build ccache: same dir as the host ccache.
-            // Unifies the cache across kernel + buildroot + cross-pod, and
-            // (importantly) overrides buildroot's default of
-            // $HOME/.buildroot-ccache -- our pod runs as a NIS uid with no
-            // /etc/passwd entry, so $HOME is empty and host-ccache's install
-            // step tried `mkdir -p //.buildroot-ccache` and died with
-            // "Permission denied" (build #47).
-            'BR2_CCACHE_DIR=/scratch/ccache',
             // Many host packages (libtool, autotools generators, perl,
             // python wheels, etc.) consult $HOME at build time. With our
             // NIS uid unmapped in the container, login resolution returns
@@ -243,70 +239,41 @@ spec:
             // and reachable by nova-ci (150707:30) via the shared gid.
             'HOME=/home/jenkins/agent',
             'BUILDROOT_SRC=/opt/buildroot',
-            // Active build output: pod-local emptyDir (NOT /scratch). Two
-            // reasons: (1) the Blossom NFS server clock runs ~10-15s ahead
-            // of the pod clock, so any file make creates on /scratch lands
-            // with a future mtime relative to the pod; cmake's try_compile()
-            // during host-cmake bootstrap produced bogus "unique_ptr - no"
-            // verdicts because the sub-make couldn't trust mtime ordering
-            // (build #45). (2) ~all build I/O is hot rewrites of .o/.a/.ko/
-            // staging files -- pod-local SSD beats NFS round-trips by an
-            // order of magnitude. ccache still accelerates compilation
-            // because the compiler invocation is what's wrapped, regardless
-            // of where the output lands.
-            'BUILDROOT_OUT=/home/jenkins/agent/buildroot-out',
-            // Buildroot defaults DL_DIR to $(TOPDIR)/dl, i.e. /opt/buildroot/dl.
-            // /opt/buildroot is baked read-only into the image (a+rX, no a+w)
-            // so cross-build downloads are forced onto writable NFS scratch.
-            // Like ccache, this is a content cache (tarballs verified by sha)
-            // so mtime semantics don't matter and cross-pod sharing is gold.
-            'BR2_DL_DIR=/scratch/buildroot-dl',
+            // Pre-built buildroot tree baked into the image (ci/Dockerfile
+            // runs `make -j$(nproc)` against ci/buildroot.config at image
+            // build time, with the static rootfs overlay already wired in
+            // via /opt/nova-overlay). Per-CI runs only install the freshly
+            // built kernel modules into ${BUILDROOT_OUT}/modules/ and let
+            // buildroot repack rootfs.cpio -- the host packages + target
+            // packages + downloads + rust toolchain are all already on
+            // disk and incremental make skips them in seconds.
+            //
+            // Lives at /opt/buildroot-out, i.e. the container's writable
+            // upper layer (pod-local, COW, no NFS clock skew). Build #45
+            // hit cmake try_compile() bogus "unique_ptr - no" verdicts
+            // because the Blossom NFS server clock runs ~10-15s ahead of
+            // the pod clock and sub-make couldn't trust mtime ordering --
+            // /opt/buildroot-out is pod-local for the same reason the
+            // old /home/jenkins/agent/buildroot-out emptyDir was.
+            'BUILDROOT_OUT=/opt/buildroot-out',
           ]) {
             sh '''
               set -eux
-              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}" "${BR2_DL_DIR}" "${BUILDROOT_OUT}/modules"
-              # /scratch/buildroot/overlay is required by BR2_ROOTFS_OVERLAY
-              # below. Fail fast (with the actual path) if it's missing
-              # or empty -- silently building a rootfs without
-              # /root/.ssh/authorized_keys regresses us back to build
-              # #64's empty-TAP false-pass: ssh "Permission denied"
-              # at the post-kexec sshd, no avocado output, Status's
-              # grep "^not ok" matches zero lines -> "All tests PASSED!".
-              NFS_OVERLAY=/scratch/buildroot/overlay
-              test -f "${NFS_OVERLAY}/root/.ssh/authorized_keys" \
-                || { echo "FAIL: ${NFS_OVERLAY}/root/.ssh/authorized_keys missing -- re-extract overlay.txz onto NFS" >&2; exit 1; }
+              mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}/modules"
               export KBUILD_BUILD_TIMESTAMP=''
-              if [ ! -f "${BUILDROOT_OUT}/.config" ]; then
-                cp "${BUILDROOT_SRC}/.config" "${BUILDROOT_OUT}/.config"
-                # The image's defconfig sets
-                #   BR2_ROOTFS_OVERLAY="modules overlay"
-                # which buildroot resolves *relative to its topdir*
-                # /opt/buildroot. Both subdirs are placeholders that the
-                # CI is meant to populate -- neither exists in
-                # espeer/buildroot:nova-test (the fork the image clones)
-                # and /opt/buildroot is baked read-only into the image
-                # anyway. Build #52 confirmed both paths break rsync:
-                # the "modules" path with no source dir tripped #49/#50,
-                # and after sending modules elsewhere, the still-missing
-                # "overlay" path then tripped #52 with the same error.
-                # Rewrite the overlay list to two absolute paths:
-                #   - ${BUILDROOT_OUT}/modules   (pod-local; populated by
-                #     `modules_install` below)
-                #   - /scratch/buildroot/overlay (NFS; ~100 MB of GPU
-                #     firmware + /root/.ssh/authorized_keys for nova@om
-                #     + /root/driver-load-test.sh + /root/tests.json +
-                #     /etc/resolv.conf -- the contents that used to live
-                #     in espeer/buildroot's overlay/. Extracted once
-                #     from overlay.txz; updates require a re-extract).
-                #     Build #64 was a false-pass because this overlay
-                #     was missing: post-kexec sshd had no root-key
-                #     authorized, ssh's "Permission denied" went to
-                #     stderr (not captured by tee), TAP files were
-                #     empty, and Status's grep "^not ok" matched
-                #     nothing -> "All tests PASSED!".
-                sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /scratch/buildroot/overlay"|' "${BUILDROOT_OUT}/.config"
-                make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
-              fi
+              # Re-write BR2_ROOTFS_OVERLAY to include the per-build
+              # modules dir alongside the image-baked static overlay.
+              # The Dockerfile sets BR2_ROOTFS_OVERLAY="/opt/nova-overlay"
+              # at image-pre-build time so the host-tool + target-package
+              # stages produce a rootfs.cpio that already has firmware +
+              # ssh key + test scripts in it; here we just teach buildroot
+              # about the additional modules overlay we are about to fill
+              # in, then let the (now-incremental) `make` repack the cpio.
+              # `olddefconfig` is run again after the sed in case the
+              # config diff propagates anywhere (it should not, but kbuild
+              # has been silently surprising before -- builds #49/#52/#65).
+              sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="'"${BUILDROOT_OUT}"'/modules /opt/nova-overlay"|' "${BUILDROOT_OUT}/.config"
+              make -C "${BUILDROOT_SRC}" O="${BUILDROOT_OUT}" olddefconfig
               # Fail-fast on a broken Rust toolchain. CONFIG_NOVA_CORE
               # and CONFIG_DRM_NOVA `depends on RUST`, so if kbuild's
               # scripts/rust_is_available.sh test fails, kconfig
@@ -326,7 +293,10 @@ spec:
               # killer takes out cc1plus mid-compile (build #46). Cap the
               # buildroot job-count to something the memory budget can
               # actually feed in parallel; the kernel build above stays at
-              # full ${JN} since clang TUs are much smaller.
+              # full ${JN} since clang TUs are much smaller. (Mostly moot
+              # now that the heavy host-tool compiles happen at image-
+              # build time, but keep the cap for the rare incremental
+              # rebuild that does drag a host package back through cc1plus.)
               BR_JN="$(( JN > 32 ? 32 : JN ))"
               time make LLVM=1 CC="ccache clang" -j"${JN}"
               # Note the /usr suffix: kernel modules_install always writes
@@ -523,11 +493,11 @@ spec:
             '''
           }
           withEnv([
-            // Same pod-local emptyDir as the Build stage (the rootfs.cpio
-            // is produced there; /scratch isn't where it lands). With
-            // O=${BUILDROOT_OUT} set explicitly, images/ is a direct
-            // child of BUILDROOT_OUT -- no "output/" prefix.
-            'BUILDROOT_OUT=/home/jenkins/agent/buildroot-out',
+            // Same path as the Build stage: /opt/buildroot-out lives in
+            // the container's writable upper layer (pod-local COW), and
+            // images/ is a direct child of BUILDROOT_OUT thanks to the
+            // explicit O= during the build.
+            'BUILDROOT_OUT=/opt/buildroot-out',
             // ssh/scp call getpwuid(getuid()) at startup and fatal-exit if
             // the lookup fails -- our NIS uid 150707 has no /etc/passwd
             // entry in the container (build #57: "scp: unknown user 150707").
