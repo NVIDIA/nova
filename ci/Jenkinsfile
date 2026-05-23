@@ -185,54 +185,6 @@ spec:
 
       currentBuild.description = buildDescription
 
-      stageName = 'Code checkout'
-      stage(stageName) {
-        echo "DIAG: entered ${stageName} body (Phase 1, sparse ci/ only)"
-        withCredentials([usernamePassword(
-          credentialsId: 'github-token',
-          passwordVariable: 'GIT_PASSWORD',
-          usernameVariable: 'GIT_USERNAME'
-        )]) {
-          GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
-        }
-        echo "DIAG: posted ${stageName} Running status; preparing shallow sparse checkout"
-        echo "DIAG: prNum=${prNum} prState=${prState}"
-        // Sparse-checkout `ci/` only. The hash inputs and the kaniko
-        // build context all live under ci/; the kernel tree is huge
-        // and not needed in this pod. Phase 2's checkout is the full
-        // tree.
-        def cloneExtensions = [
-          [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
-          [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'ci/']]],
-        ]
-        if ('Open'.equalsIgnoreCase(prState)) {
-          checkout changelog: true, poll: false, scm: [
-            $class: 'GitSCM',
-            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
-            extensions: cloneExtensions,
-            userRemoteConfigs: [[
-              credentialsId: 'github-token',
-              url: cloneUrl,
-              refspec: "+refs/pull/${prNum}/head:refs/remotes/origin/pr/${prNum}"
-            ]]
-          ]
-        } else if ('Merged'.equalsIgnoreCase(prState)) {
-          checkout changelog: true, poll: false, scm: [
-            $class: 'GitSCM',
-            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
-            extensions: cloneExtensions,
-            userRemoteConfigs: [[
-              credentialsId: 'github-token',
-              url: cloneUrl,
-              refspec: "+refs/pull/${prNum}/merge:refs/remotes/origin/pr/${prNum}"
-            ]]
-          ]
-        } else {
-          error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
-        }
-        echo "DIAG: Phase 1 checkout returned"
-      }
-
       stageName = 'Ensure agent image'
       stage(stageName) {
         withCredentials([usernamePassword(
@@ -242,8 +194,41 @@ spec:
         )]) {
           GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
         }
-        def imageBuild = load 'ci/imageBuild.groovy'
-        ciImage = imageBuild.ensureImage([:])
+        // CI logic (ci/Dockerfile, ci/build-image.sh, ci/image-manifest,
+        // ci/hash-inputs.sh, ci/overlay/, etc.) is checked out from the
+        // pinned trunk branch -- NOT the PR. Reasons:
+        //   1. Security: the CI machinery runs on a privileged Jenkins
+        //      agent with registry-push credentials. A PR must not be
+        //      able to substitute ci/ files (e.g. inject a malicious
+        //      Dockerfile that exfiltrates the gitlab_epeer token).
+        //   2. Consistency: this Jenkinsfile itself is loaded by Blossom
+        //      from the same pinned ref (configured in the job UI), so
+        //      everything that drives the image build comes from the
+        //      same trusted snapshot.
+        //   3. Iteration: to test CI changes, push to a branch and point
+        //      the Jenkins job at that branch directly via the UI; the
+        //      kernel tree under test is still supplied by Phase 2's PR
+        //      checkout, unaffected.
+        // Sparse-checkout limits to ci/ since the kernel tree is huge
+        // and not needed in this pod.
+        def cloneExtensions = [
+          [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
+          [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'ci/']]],
+        ]
+        checkout changelog: false, poll: false, scm: [
+          $class: 'GitSCM',
+          branches: [[name: 'refs/remotes/origin/nova-test']],
+          extensions: cloneExtensions,
+          userRemoteConfigs: [[
+            credentialsId: 'github-token',
+            url: 'https://github.com/NVIDIA/nova.git',
+            refspec: '+refs/heads/nova-test:refs/remotes/origin/nova-test'
+          ]]
+        ]
+        echo "DIAG: Phase 1 trunk (nova-test) ci/ checkout returned"
+        sh 'ls -la ci/'
+
+        ciImage = ensureImage([:])
         echo "Phase 1 resolved ciImage = ${ciImage}"
       }
     } catch (Exception ex) {
@@ -982,5 +967,205 @@ spec:
         }
       }
     }
+  }
+}
+
+// ============================================================================
+// Helpers used by Phase 1's "Ensure agent image" stage.
+// ----------------------------------------------------------------------------
+// These are NOT part of the image hash (ci/hash-inputs.sh covers only the
+// files kaniko actually reads: Dockerfile, buildroot.config, overlay/,
+// build-image.sh, image-manifest). The Jenkinsfile is orchestration --
+// editing it changes how the image is built only via what it passes to
+// kaniko, and those inputs (pins + Dockerfile) are already in the hash.
+// Same reasoning as why hash-inputs.sh itself is not in the manifest.
+// ============================================================================
+
+// Compute the content-addressed tag, probe the GitLab registry, and on a
+// miss stage + kaniko-build + push the new image. Returns the resolved
+// "registry/repo:image-<sha12>" reference for Phase 2's nova-ci pod.
+//
+// Caller must be inside a podTemplate with `jnlp` (for the bash + curl +
+// kaniko-context-staging) and `kaniko` (only invoked on a cache miss).
+def ensureImage(Map opts) {
+  String registry          = opts.registry          ?: 'gitlab-master.nvidia.com:5005'
+  String repo              = opts.repo              ?: 'epeer/nova-test/nova-kernel-ci'
+  String gitlabCredId      = opts.gitlabCredId      ?: 'gitlab_epeer'
+  String artifactoryCredId = opts.artifactoryCredId ?: 'artifactory-token'
+
+  // Hash via ci/hash-inputs.sh -- single source of truth for the
+  // algorithm. The Jenkinsfile never re-implements the hash.
+  String hash = sh(returnStdout: true, script: 'ci/hash-inputs.sh').trim()
+  if (!(hash ==~ /[0-9a-f]{12}/)) {
+    error("imageBuild: hash-inputs.sh produced invalid output: '${hash}'")
+  }
+  String tag = "image-${hash}"
+  String imageFull = "${registry}/${repo}:${tag}"
+  echo "imageBuild: computed tag = ${tag}"
+  echo "imageBuild: target image = ${imageFull}"
+
+  Map pins = parseManifestPins()
+  echo "imageBuild: manifest pins = ${pins}"
+  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version'].each { k ->
+    if (!pins[k]) error("imageBuild: ci/image-manifest is missing required pin '${k}'")
+  }
+
+  // Probe inside withCredentials so the bearer-token exchange has
+  // basic-auth available. On a cache hit we exit here.
+  boolean exists = false
+  withCredentials([usernamePassword(
+      credentialsId: gitlabCredId,
+      usernameVariable: 'GITLAB_USER',
+      passwordVariable: 'GITLAB_TOKEN')]) {
+    exists = imageTagExists(registry, repo, tag)
+  }
+  if (exists) {
+    echo "imageBuild: ${imageFull} already in registry; skipping rebuild"
+    return imageFull
+  }
+  echo "imageBuild: ${imageFull} not in registry; building with kaniko"
+
+  // Stage the build context on jnlp (curl, bash, tar -- kaniko's
+  // distroless busybox layer is too minimal to host the colossus
+  // download). build-image.sh writes Dockerfile + buildroot.config +
+  // overlay/ + colossus-cli.tar.gz into the staging dir.
+  String ctx = '/home/jenkins/agent/ctx'
+  withCredentials([usernamePassword(
+      credentialsId: artifactoryCredId,
+      usernameVariable: 'ARTIFACTORY_USER',
+      passwordVariable: 'ARTIFACTORY_TOKEN')]) {
+    sh """
+      set -eux
+      rm -rf '${ctx}'
+      COLOSSUS_VERSION='${pins.colossus_version}' \\
+        ci/build-image.sh --stage-only '${ctx}' --tag '${tag}'
+      ls -la '${ctx}'
+    """
+  }
+
+  // Run kaniko. config.json is synthesized at runtime from the
+  // gitlab_epeer cred (basic-auth-over-https against the GitLab
+  // registry); `set +x` keeps the token out of the build log.
+  container('kaniko') {
+    withCredentials([usernamePassword(
+        credentialsId: gitlabCredId,
+        usernameVariable: 'GITLAB_USER',
+        passwordVariable: 'GITLAB_TOKEN')]) {
+      sh """#!/busybox/sh
+        set -eu
+        mkdir -p /kaniko/.docker
+        {
+          set +x
+          AUTH_B64=\$(printf '%s:%s' "\$GITLAB_USER" "\$GITLAB_TOKEN" | base64 | tr -d '\\n')
+          printf '{"auths":{"${registry}":{"auth":"%s"}}}\\n' "\$AUTH_B64" > /kaniko/.docker/config.json
+        } 2>/dev/null
+        chmod 0600 /kaniko/.docker/config.json
+        set -x
+        /kaniko/executor \\
+          --context=dir://${ctx} \\
+          --dockerfile=${ctx}/Dockerfile \\
+          --destination='${imageFull}' \\
+          --build-arg BUILDROOT_TAG=${pins.buildroot_tag} \\
+          --build-arg LINUX_FIRMWARE_GIT_SHA=${pins.linux_firmware_sha} \\
+          --snapshot-mode=redo \\
+          --use-new-run \\
+          --cleanup \\
+          --verbosity=info
+      """
+    }
+  }
+
+  sh "rm -rf '${ctx}' || true"
+  return imageFull
+}
+
+// Parse the non-`input=` lines in ci/image-manifest into a key->value
+// map. Comments and blanks are skipped. The shape mirrors the bash
+// parser in hash-inputs.sh; the two must stay in sync.
+Map parseManifestPins() {
+  String content = readFile('ci/image-manifest')
+  Map pins = [:]
+  for (String raw : content.split('\n')) {
+    String line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    if (line.startsWith('input=')) continue
+    int eq = line.indexOf('=')
+    if (eq <= 0) continue
+    pins[line.substring(0, eq).trim()] = line.substring(eq + 1).trim()
+  }
+  return pins
+}
+
+// GitLab registry HEAD probe with the bearer-token dance.
+//
+// Returns true iff /v2/<repo>/manifests/<tag> exists. Errors out (rather
+// than returning false) on anything other than 200 or 404 -- a
+// misconfigured probe that silently returned "not found" would trigger
+// an expensive rebuild on every CI run, which we'd rather notice loudly
+// than ignore quietly.
+//
+// Why we don't just `docker manifest inspect` or `crane manifest`:
+// jnlp has neither. curl + a tiny token exchange is the lowest-
+// dependency way to ask the question, and the GitLab registry's
+// 401-with-WWW-Authenticate response is straightforward.
+boolean imageTagExists(String registry, String repo, String tag) {
+  int rc = sh(returnStatus: true, script: """
+    set -eu
+    set +x  # don't leak GITLAB_TOKEN into the log
+
+    URL='https://${registry}/v2/${repo}/manifests/${tag}'
+
+    # 1. Anonymous HEAD. Capture WWW-Authenticate from the 401.
+    code=\$(curl -sS -o /dev/null -w '%{http_code}' -I "\${URL}" -D /tmp/probe.headers || true)
+    if [ "\${code}" = '200' ]; then
+      echo 'probe: anonymous 200 (public)' >&2
+      exit 0
+    fi
+    if [ "\${code}" != '401' ]; then
+      echo "probe: unexpected status \${code} on anonymous HEAD" >&2
+      exit 2
+    fi
+
+    # 2. Parse realm + service + scope from WWW-Authenticate.
+    www=\$(grep -i '^www-authenticate:' /tmp/probe.headers | tr -d '\\r' || true)
+    realm=\$(  printf '%s' "\${www}" | sed -nE 's/.*realm="([^"]+)".*/\\1/p')
+    service=\$(printf '%s' "\${www}" | sed -nE 's/.*service="([^"]+)".*/\\1/p')
+    scope=\$(  printf '%s' "\${www}" | sed -nE 's/.*scope="([^"]+)".*/\\1/p')
+    if [ -z "\${realm}" ] || [ -z "\${service}" ]; then
+      echo "probe: cannot parse WWW-Authenticate: \${www}" >&2
+      exit 2
+    fi
+    [ -n "\${scope}" ] || scope='repository:${repo}:pull'
+
+    # 3. Exchange basic auth -> JWT.
+    token=\$(curl -sSf -u "\${GITLAB_USER}:\${GITLAB_TOKEN}" \\
+      --get \\
+      --data-urlencode "service=\${service}" \\
+      --data-urlencode "scope=\${scope}" \\
+      "\${realm}" \\
+      | sed -nE 's/.*"token":"([^"]+)".*/\\1/p')
+    if [ -z "\${token}" ]; then
+      echo 'probe: failed to obtain registry bearer token' >&2
+      exit 2
+    fi
+
+    # 4. Authed HEAD.
+    auth_code=\$(curl -sS -o /dev/null -w '%{http_code}' -I \\
+      -H "Authorization: Bearer \${token}" "\${URL}")
+    echo "probe: authed HEAD -> \${auth_code}" >&2
+    case "\${auth_code}" in
+      200) exit 0 ;;
+      404) exit 1 ;;
+      *)
+        echo "probe: unexpected status \${auth_code} on authed HEAD" >&2
+        exit 2
+        ;;
+    esac
+  """)
+
+  switch (rc) {
+    case 0:  return true
+    case 1:  return false
+    default: error("imageBuild: registry probe failed (rc=${rc}); refusing to assume image present or absent")
   }
 }
