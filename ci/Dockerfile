@@ -1,11 +1,21 @@
 # Nova kernel CI agent — Blossom Jenkins `nova-ci` container — public base layer.
-# To build + push the full image (this base + the private colossus layer), run:
-#   ci/build-image.sh --push                   # tag = today (YYYY-MM-DD)
-#   ci/build-image.sh --push --tag 2026-05-22  # explicit tag
-# Optional build-args (passed through by the script):
+#
+# This Dockerfile is consumed two ways:
+#   1. Inline in the main Jenkins pipeline: the Phase 1 "Ensure agent image"
+#      stage hashes ci/image-manifest + listed inputs, probes the registry,
+#      and on a miss runs kaniko against this Dockerfile with --build-args
+#      taken from the manifest's pin lines.
+#   2. Local developer builds via ci/build-image.sh (docker buildx; reads
+#      the same manifest for pin defaults).
+#
+# Required build-args (NO defaults; image build fails closed without them
+# so a missing pin is a loud error rather than a silently-floating image):
+#   BUILDROOT_TAG=<tag>            — upstream buildroot tag (pinned in
+#                                    ci/image-manifest as buildroot_tag).
+#   LINUX_FIRMWARE_GIT_SHA=<sha>   — pin upstream linux-firmware (pinned in
+#                                    ci/image-manifest as linux_firmware_sha).
+# Optional build-arg:
 #   TAP_SUMMARY_GIT_SHA=<commit>   — pin pcolby/tap-summary summary.gawk.
-#   BUILDROOT_TAG=<tag>            — upstream buildroot tag (default 2025.08.2).
-#   LINUX_FIRMWARE_GIT_SHA=<sha>   — pin upstream linux-firmware (default: HEAD at image build).
 #
 # Buildroot *sources* live in /opt/buildroot; the build is pre-staged in the
 # image at /opt/buildroot-out (host + target packages, rootfs staging, etc.).
@@ -113,7 +123,11 @@ ENV PATH="${CARGO_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 # Pre-2026-05-22 we cloned espeer/buildroot:nova-test, whose only delta from
 # upstream 2025.08.2 was a single commit adding .config. We now pin to the
 # upstream tag and bake the same .config from this repo (ci/buildroot.config).
-ARG BUILDROOT_TAG=2025.08.2
+# Required build-arg from ci/image-manifest (buildroot_tag=). No default
+# value: a missing --build-arg fails the clone step loudly rather than
+# silently producing a "whatever main was today" image.
+ARG BUILDROOT_TAG
+RUN test -n "${BUILDROOT_TAG}" || (echo "ERROR: BUILDROOT_TAG --build-arg is required (pin lives in ci/image-manifest)" >&2 && exit 1)
 RUN git clone --depth 1 --branch "${BUILDROOT_TAG}" \
         https://gitlab.com/buildroot.org/buildroot.git /opt/buildroot \
  && chmod -R a+rX /opt/buildroot \
@@ -144,15 +158,18 @@ RUN chmod 0700 /opt/nova-overlay/root/.ssh \
 # directories: /lib" if we put a top-level /lib in the overlay. The target
 # image still resolves /lib/firmware/nvidia/* at runtime because /lib is a
 # symlink to /usr/lib in the merged-usr layout.
-ARG LINUX_FIRMWARE_GIT_SHA=
+#
+# Required build-arg from ci/image-manifest (linux_firmware_sha=). No default
+# value: bumping the manifest pin is the only supported way to refresh the
+# firmware blobs in the agent image. Image build fails closed without it.
+ARG LINUX_FIRMWARE_GIT_SHA
 RUN set -eux; \
-    git clone --depth 1 --no-tags --filter=blob:none --sparse \
+    test -n "${LINUX_FIRMWARE_GIT_SHA}" || (echo "ERROR: LINUX_FIRMWARE_GIT_SHA --build-arg is required (pin lives in ci/image-manifest)" >&2 && exit 1); \
+    git clone --no-checkout --no-tags --filter=blob:none --sparse \
         https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
         /tmp/lf; \
-    if [ -n "${LINUX_FIRMWARE_GIT_SHA}" ]; then \
-      git -C /tmp/lf fetch --depth 1 origin "${LINUX_FIRMWARE_GIT_SHA}"; \
-      git -C /tmp/lf checkout -q "${LINUX_FIRMWARE_GIT_SHA}"; \
-    fi; \
+    git -C /tmp/lf fetch --depth 1 origin "${LINUX_FIRMWARE_GIT_SHA}"; \
+    git -C /tmp/lf checkout -q "${LINUX_FIRMWARE_GIT_SHA}"; \
     git -C /tmp/lf sparse-checkout set --cone nvidia; \
     mkdir -p /opt/nova-overlay/usr/lib/firmware; \
     cp -a /tmp/lf/nvidia /opt/nova-overlay/usr/lib/firmware/nvidia; \

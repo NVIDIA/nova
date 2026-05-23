@@ -1,0 +1,51 @@
+# Authoritative manifest for the nova-ci agent image.
+#
+# The Jenkinsfile derives the image tag from this file alone:
+#     image-$(sha256(image-manifest + every file listed by input=)[:12])
+# so the tag changes if and only if any pin below changes, any listed
+# file's contents change, or the input list itself changes. The
+# manifest lists itself as an input (see the trailing `input=` line)
+# so editing this file -- e.g. bumping a comment or a pin -- always
+# invalidates the cache too.
+#
+# To bump a pin / input list:
+#   1. Edit this file.
+#   2. Push to nova-test.
+#   3. Trigger the main pipeline. The Build-image stage will see no
+#      matching tag in the registry and rebuild the image inline via
+#      kaniko, then continue with the rest of the CI run.
+#
+# Format: `key=value` per line. Blank lines and `#` comments are
+# ignored. Two key conventions:
+#   <name>=<value>   pinned external version, passed to the Dockerfile
+#                    as --build-arg <NAME>=<value>.
+#   input=<path>     in-tree input file or directory (relative to ci/);
+#                    directories are walked recursively. Order is
+#                    irrelevant; hash-inputs.sh sorts before hashing.
+
+# --- External version pins (consumed as Dockerfile --build-args) ---
+# Upstream buildroot tag. Cloned from gitlab.com/buildroot.org/buildroot.git
+# at this tag inside the Dockerfile.
+buildroot_tag=2025.08.2
+
+# Upstream linux-firmware commit. Pinned for reproducibility -- without
+# this, the Dockerfile's sparse-clone takes whatever main was at image
+# build time and two runs of the same Dockerfile produce different
+# images. Bump when you want to pull in newer NVIDIA firmware blobs.
+linux_firmware_sha=adb6dceb45b98c4149e1ce68fc1a5f394fd67695
+
+# Colossus CLI version. Tarball is fetched from
+#   https://artifactory.nvidia.com/artifactory/sw-ipp-colossus-generic/colossus-cli/<v>/
+# by ci/build-image.sh (which runs on the jnlp container to stage the
+# build context for kaniko). To pick a different version, list the
+# folder at the URL above and update this pin.
+colossus_version=2.3.0
+
+# --- In-tree hash inputs (paths relative to ci/) ---
+# Anything that affects the image's content but isn't an external pin
+# goes here. Order doesn't matter; the hash script sorts.
+input=Dockerfile
+input=buildroot.config
+input=build-image.sh
+input=overlay
+input=image-manifest

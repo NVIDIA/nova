@@ -13,22 +13,30 @@
 # finds in ~/.netrc for artifactory.nvidia.com.
 #
 # Usage (local dev, builds + smoke-tests with the host's docker):
-#   ci/build-image.sh                          # build only, tag = today (YYYY-MM-DD)
+#   ci/build-image.sh                          # build only, tag = image-<sha12> from manifest
 #   ci/build-image.sh --push                   # build + docker push
-#   ci/build-image.sh --tag 2026-05-13         # explicit tag
-#   ci/build-image.sh --push --tag 2026-05-13
+#   ci/build-image.sh --tag image-deadbeef0123 # explicit tag (overrides manifest hash)
+#   ci/build-image.sh --push --tag image-deadbeef0123
 #
 # Usage (Jenkins / kaniko -- stage the build context but do not invoke docker):
-#   ci/build-image.sh --stage-only DIR --tag 2026-05-22-deadbeef
+#   ci/build-image.sh --stage-only DIR --tag image-deadbeef0123
 #       writes Dockerfile + buildroot.config + overlay/ + colossus-cli.tar.gz
 #       into DIR, ready for `kaniko --context=dir://DIR --dockerfile=DIR/Dockerfile`.
 #       Skips the `docker buildx build`, the smoke check, and the push.
 #
+# Pin resolution: BUILDROOT_TAG, LINUX_FIRMWARE_GIT_SHA, COLOSSUS_VERSION
+# default to the values pinned in ci/image-manifest. They can be overridden
+# via environment variable when iterating locally (e.g. to test a newer
+# linux-firmware sha before updating the pin). The first two are also passed
+# through as --build-arg to docker buildx; the third drives the colossus
+# tarball download and the private-layer COPY in the generated Dockerfile.
+#
 # Environment overrides:
 #   REGISTRY            gitlab-master.nvidia.com:5005
 #   REPO                epeer/nova-test/nova-kernel-ci
-#   COLOSSUS_VERSION    Colossus CLI version to install (default: latest in
-#                       sw-ipp-colossus-generic/colossus-cli/).
+#   BUILDROOT_TAG       upstream buildroot tag (default: manifest pin).
+#   LINUX_FIRMWARE_GIT_SHA  linux-firmware commit sha (default: manifest pin).
+#   COLOSSUS_VERSION    Colossus CLI version to install (default: manifest pin).
 #   COLOSSUS_TARBALL    Path to a local copy of colossus_cli_<v>_linux_amd64.tar.gz.
 #                       When set, takes precedence over downloading.
 #   ARTIFACTORY_USER    Artifactory account name (default: $USER).
@@ -54,7 +62,7 @@ ARTIFACTORY_HOST="${ARTIFACTORY_HOST:-artifactory.nvidia.com}"
 ARTIFACTORY_REPO="${ARTIFACTORY_REPO:-sw-ipp-colossus-generic}"
 ARTIFACTORY_USER="${ARTIFACTORY_USER:-${USER:-}}"
 
-TAG="$(date +%Y-%m-%d)"
+TAG=""
 PUSH=0
 STAGE_ONLY_DIR=""
 while [[ $# -gt 0 ]]; do
@@ -65,7 +73,7 @@ while [[ $# -gt 0 ]]; do
     --stage-only)   STAGE_ONLY_DIR="$2"; shift 2 ;;
     --stage-only=*) STAGE_ONLY_DIR="${1#--stage-only=}"; shift ;;
     -h|--help)
-      sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -77,11 +85,56 @@ if [[ -n "${STAGE_ONLY_DIR}" && "${PUSH}" -eq 1 ]]; then
   exit 2
 fi
 
+CI_DIR="$(cd "$(dirname "$0")" && pwd)"
+MANIFEST="${CI_DIR}/image-manifest"
+REPO_ROOT="$(cd "${CI_DIR}/.." && pwd)"
+
+# Read pins from ci/image-manifest. Each KEY=VALUE line that isn't an
+# `input=` and isn't a comment exports MANIFEST_<key>. Env vars override
+# the manifest (useful for local "test this newer sha before bumping
+# the pin" iterations).
+if [[ ! -f "${MANIFEST}" ]]; then
+  echo "ERROR: ${MANIFEST} not found; cannot resolve build pins" >&2
+  exit 1
+fi
+manifest_pin() {
+  # $1 = key (e.g. buildroot_tag). Echoes the value or empty.
+  awk -F= -v k="$1" '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    $1 == "input"   { next }
+    $1 == k         { sub(/^[^=]*=/, ""); sub(/[[:space:]]+$/, ""); print; exit }
+  ' "${MANIFEST}"
+}
+: "${BUILDROOT_TAG:=$(manifest_pin buildroot_tag)}"
+: "${LINUX_FIRMWARE_GIT_SHA:=$(manifest_pin linux_firmware_sha)}"
+: "${COLOSSUS_VERSION:=$(manifest_pin colossus_version)}"
+for v in BUILDROOT_TAG LINUX_FIRMWARE_GIT_SHA COLOSSUS_VERSION; do
+  if [[ -z "${!v}" ]]; then
+    echo "ERROR: ${v} is empty after manifest resolution; check ${MANIFEST}" >&2
+    exit 1
+  fi
+done
+
+# Default tag: image-<sha12> from hash-inputs.sh. The hash script is the
+# canonical algorithm; we never re-implement it here. Both the Jenkinsfile
+# and this script call it, so a `--tag` default from this script matches
+# the tag the pipeline would probe -- letting a local `--push` populate
+# the registry for a later CI run on the same inputs.
+if [[ -z "${TAG}" ]]; then
+  HASH="$("${CI_DIR}/hash-inputs.sh")"
+  TAG="image-${HASH}"
+  echo "==> derived tag from manifest hash: ${TAG}"
+fi
+
 IMAGE="${REGISTRY}/${REPO}:${TAG}"
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "==> target image:  ${IMAGE}"
 echo "==> repo root:     ${REPO_ROOT}"
+echo "==> pins:"
+echo "      buildroot_tag       = ${BUILDROOT_TAG}"
+echo "      linux_firmware_sha  = ${LINUX_FIRMWARE_GIT_SHA}"
+echo "      colossus_version    = ${COLOSSUS_VERSION}"
 
 # Stage colossus next to the build context. The Dockerfile (and its private
 # layer) only sees files inside the build context, so we drop the binary into
@@ -136,26 +189,10 @@ else
     CURL_AUTH=(-n)
   fi
   ARTI_BASE="https://${ARTIFACTORY_HOST}/artifactory/${ARTIFACTORY_REPO}/colossus-cli"
-  ARTI_API="https://${ARTIFACTORY_HOST}/artifactory/api/storage/${ARTIFACTORY_REPO}/colossus-cli"
-  if [[ -z "${COLOSSUS_VERSION:-}" ]]; then
-    echo "==> resolving latest colossus version from ${ARTI_API}/"
-    # JFrog returns {"children":[{"uri":"/X.Y.Z","folder":true},...]}.
-    # We don't ship a real JSON parser dependency here -- the Jenkins
-    # jnlp container is minimal and may have neither python3 nor jq --
-    # so pull the version strings out with grep + sort -V instead.
-    # `sort -V` is GNU coreutils (always present on the Linux Blossom
-    # nodes and on recent macOS).
-    COLOSSUS_VERSION="$(curl -sf "${CURL_AUTH[@]}" "${ARTI_API}/" \
-      | tr ',' '\n' \
-      | grep -oE '"uri"[[:space:]]*:[[:space:]]*"/[0-9][0-9.]*"' \
-      | sed -E 's|.*"/([0-9.]+)".*|\1|' \
-      | sort -V \
-      | tail -1)"
-    if [[ -z "${COLOSSUS_VERSION}" ]]; then
-      echo "ERROR: could not parse a colossus version from ${ARTI_API}/" >&2
-      exit 1
-    fi
-  fi
+  # COLOSSUS_VERSION is already resolved from ci/image-manifest above
+  # (with env override). The previous "auto-discover latest from
+  # artifactory" path is gone -- floating to "whatever artifactory has
+  # today" defeats the whole point of content-addressed images.
   COLOSSUS_VER="${COLOSSUS_VERSION}"
   URL="${ARTI_BASE}/${COLOSSUS_VERSION}/colossus_cli_${COLOSSUS_VERSION}_linux_amd64.tar.gz"
   echo "==> downloading colossus ${COLOSSUS_VERSION} from ${URL}"
@@ -192,7 +229,10 @@ if [[ -n "${STAGE_ONLY_DIR}" ]]; then
   ls -la "${BUILD_CTX}"
   echo
   echo "Hand off to kaniko, e.g.:"
-  echo "  /kaniko/executor --context=dir://${BUILD_CTX} --dockerfile=${BUILD_CTX}/Dockerfile --destination=${IMAGE}"
+  echo "  /kaniko/executor --context=dir://${BUILD_CTX} --dockerfile=${BUILD_CTX}/Dockerfile \\"
+  echo "    --build-arg BUILDROOT_TAG=${BUILDROOT_TAG} \\"
+  echo "    --build-arg LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA} \\"
+  echo "    --destination=${IMAGE}"
   # Emit the resolved image reference on the very last line so callers can
   # grab it with `tail -n1` without parsing log noise above.
   echo "${IMAGE}"
@@ -215,6 +255,8 @@ echo "==> docker build --platform ${PLATFORM} -t ${IMAGE}"
   --pull \
   --platform "${PLATFORM}" \
   --load \
+  --build-arg "BUILDROOT_TAG=${BUILDROOT_TAG}" \
+  --build-arg "LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA}" \
   -t "${IMAGE}" \
   "${BUILD_CTX}"
 

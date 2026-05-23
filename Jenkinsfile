@@ -65,12 +65,39 @@ properties([
   ])
 ])
 
-// CI image tag is intentionally NOT a job parameter: Jenkins persists the
-// last-used parameter value and ignores subsequent defaultValue changes in the
-// Jenkinsfile, so bumping the tag with a parameter required a manual "Build
-// with Parameters" round-trip every time. Keep this as a plain script var so
-// every commit that bumps the tag takes effect on the next /build comment.
-def ciImage = 'gitlab-master.nvidia.com:5005/epeer/nova-test/nova-kernel-ci:2026-05-22-d62390752'
+// CI image is content-addressed from ci/image-manifest. Phase 1 below
+// computes the tag (sha256(manifest + listed inputs)[:12]), probes the
+// GitLab Container Registry for it, and either reuses the existing image
+// or kaniko-builds + pushes a new one. ciImage is assigned by that stage
+// and consumed by the Phase 2 podTemplate as the nova-ci container image.
+//
+// This replaces the previous "edit a hardcoded :YYYY-MM-DD-<sha> string"
+// scheme. Bumping a pin (or any listed input under ci/) automatically
+// invalidates the cache; the rebuild happens inline as the first stage
+// of the next CI run, without any separate "nova-ci-image" pipeline.
+String ciImage = ''
+
+// Pipeline-wide state shared across Phase 1 (jnlp + kaniko pod, for
+// image probe/build) and Phase 2 (jnlp + nova-ci pod, for the kernel
+// build + hardware test). All entries are plain Strings/booleans so
+// they survive CPS save points across the pod boundary.
+//   buildDescription / prNum / cloneUrl / prState / repoName -- captured
+//     in Phase 1's Get Token stage from githubData; reused for status
+//     posts and the second checkout in Phase 2 (kernel tree). The PR
+//     branch / merge ref selection logic is identical in both phases.
+//   tokenAcquired -- gated by the catch blocks: only post a "Failed"
+//     GitHub commit status if we actually obtained a token; otherwise
+//     the status API call itself would fail and we'd lose the original
+//     exception.
+//   stageName -- updated as each stage enters; the catch block uses it
+//     to report which stage died.
+String buildDescription = ''
+String prNum = ''
+String cloneUrl = ''
+String prState = ''
+String repoName = ''
+boolean tokenAcquired = false
+def stageName = ''
 
 def runUid = params.RUN_AS_UID?.trim()
 def runGid = params.RUN_AS_GID?.trim()
@@ -84,6 +111,175 @@ if (!runUid || !runGid) {
 // Inlining sidesteps the helper-method dispatch entirely. We also do not retain a GithubHelper
 // instance in a long-lived local across save points (see comment inside the node block below).
 
+// ============================================================================
+// Phase 1: image probe + optional rebuild.
+// ----------------------------------------------------------------------------
+// Pod is jnlp + kaniko only -- no nova-ci, because what nova-ci image to run
+// is exactly the question this phase answers. We do the Get Token + a sparse
+// checkout of ci/ here (the hash inputs all live under ci/, and the kernel
+// tree isn't needed yet). On a registry hit (the common case) this phase
+// completes in well under a minute and Phase 2 reuses the cached image. On
+// a miss we stage the build context on jnlp and kaniko-build + push the
+// new tag, then proceed to Phase 2 with it.
+//
+// Why a separate pod rather than nesting kaniko into the Phase 2 pod: a pod's
+// container images are fixed at allocation time, so we can't allocate the
+// heavy nova-ci pod until we know what tag to pull. Two pods sequentially is
+// the cleanest way to break the chicken-and-egg.
+// ============================================================================
+podTemplate(
+  cloud: 'sc-ipp-blossom-prod',
+  yaml: """
+apiVersion: v1
+kind: Pod
+spec:
+  nodeSelector:
+    kubernetes.io/os: "linux"
+  containers:
+  - name: jnlp
+    command: ["/bin/sh", "-c"]
+    args: ["umask 0002 && exec /usr/local/bin/jenkins-agent"]
+    securityContext:
+      runAsGroup: ${runGid.toInteger()}
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.23.0-debug
+    imagePullPolicy: IfNotPresent
+    command: ["/busybox/sh", "-c", "sleep infinity"]
+    tty: true
+    resources:
+      requests:
+        memory: 2Gi
+        cpu: "1"
+      limits:
+        # kaniko's memory usage scales with layer size; the buildroot
+        # pre-build creates a ~6 GiB writable layer (host tools + target
+        # rootfs staging). 16 GiB is comfortably above that with room
+        # for the snapshotter's working set.
+        memory: 16Gi
+        cpu: "8"
+"""
+) {
+  node(POD_LABEL) {
+    try {
+      stage('Get Token') {
+        withCredentials([usernamePassword(
+          credentialsId: 'github-token',
+          passwordVariable: 'GIT_PASSWORD',
+          usernameVariable: 'GIT_USERNAME'
+        )]) {
+          def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
+          buildDescription = h.getBuildDescription()
+          prNum = h.getPRNumber().toString()
+          cloneUrl = h.getCloneUrl()
+          prState = h.getPRState()
+          repoName = h.getRepoName()
+          tokenAcquired = true
+        }
+      }
+
+      currentBuild.description = buildDescription
+
+      stageName = 'Code checkout'
+      stage(stageName) {
+        echo "DIAG: entered ${stageName} body (Phase 1, sparse ci/ only)"
+        withCredentials([usernamePassword(
+          credentialsId: 'github-token',
+          passwordVariable: 'GIT_PASSWORD',
+          usernameVariable: 'GIT_USERNAME'
+        )]) {
+          GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+        }
+        echo "DIAG: posted ${stageName} Running status; preparing shallow sparse checkout"
+        echo "DIAG: prNum=${prNum} prState=${prState}"
+        // Sparse-checkout `ci/` only. The hash inputs and the kaniko
+        // build context all live under ci/; the kernel tree is huge
+        // and not needed in this pod. Phase 2's checkout is the full
+        // tree.
+        def cloneExtensions = [
+          [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
+          [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'ci/']]],
+        ]
+        if ('Open'.equalsIgnoreCase(prState)) {
+          checkout changelog: true, poll: false, scm: [
+            $class: 'GitSCM',
+            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
+            extensions: cloneExtensions,
+            userRemoteConfigs: [[
+              credentialsId: 'github-token',
+              url: cloneUrl,
+              refspec: "+refs/pull/${prNum}/head:refs/remotes/origin/pr/${prNum}"
+            ]]
+          ]
+        } else if ('Merged'.equalsIgnoreCase(prState)) {
+          checkout changelog: true, poll: false, scm: [
+            $class: 'GitSCM',
+            branches: [[name: "refs/remotes/origin/pr/${prNum}"]],
+            extensions: cloneExtensions,
+            userRemoteConfigs: [[
+              credentialsId: 'github-token',
+              url: cloneUrl,
+              refspec: "+refs/pull/${prNum}/merge:refs/remotes/origin/pr/${prNum}"
+            ]]
+          ]
+        } else {
+          error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
+        }
+        echo "DIAG: Phase 1 checkout returned"
+      }
+
+      stageName = 'Ensure agent image'
+      stage(stageName) {
+        withCredentials([usernamePassword(
+          credentialsId: 'github-token',
+          passwordVariable: 'GIT_PASSWORD',
+          usernameVariable: 'GIT_USERNAME'
+        )]) {
+          GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
+        }
+        def imageBuild = load 'ci/imageBuild.groovy'
+        ciImage = imageBuild.ensureImage([:])
+        echo "Phase 1 resolved ciImage = ${ciImage}"
+      }
+    } catch (Exception ex) {
+      currentBuild.result = 'FAILURE'
+      echo "DIAG-catch (Phase 1): ${ex}"
+      if (tokenAcquired) {
+        try {
+          withCredentials([usernamePassword(
+            credentialsId: 'github-token',
+            passwordVariable: 'GIT_PASSWORD',
+            usernameVariable: 'GIT_USERNAME'
+          )]) {
+            GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            echo "DIAG: posted ${stageName} Failed status (Phase 1)"
+          }
+        } catch (Exception ignored) {
+          echo "Could not update GitHub status: ${ignored}"
+        }
+      }
+      throw ex
+    }
+  }
+}
+
+if (!ciImage) {
+  error('Phase 1 did not resolve a ciImage; refusing to start Phase 2.')
+}
+
+// ============================================================================
+// Phase 2: kernel build + hardware test.
+// ----------------------------------------------------------------------------
+// Heavy pod: jnlp + nova-ci@${ciImage} + the NFS scratch mount for ccache.
+// We re-checkout the full PR tree here (Phase 1's sparse checkout only
+// had ci/). No GitHub status post for the re-checkout: from the PR's
+// perspective, Code checkout already passed in Phase 1.
+// ============================================================================
 podTemplate(
   cloud: 'sc-ipp-blossom-prod',
   yaml: """
@@ -139,49 +335,24 @@ spec:
   ]
 ) {
   node(POD_LABEL) {
-    // PR/commit metadata captured as plain strings during Get Token. We deliberately do NOT
-    // keep a GithubHelper instance in a long-lived local: the helper holds GHCommitStatus
-    // references (returned by updateCommitStatus) which are not Serializable, and CPS saves
-    // the program state on every step boundary -- a single live helper local causes
-    // NotSerializableException: org.kohsuke.github.GHCommitStatus on the next save.
-    String buildDescription = ''
-    String prNum = ''
-    String cloneUrl = ''
-    String prState = ''
-    String repoName = ''
-    boolean tokenAcquired = false
-    def stageName = ''
-
-    stage('Get Token') {
-      withCredentials([usernamePassword(
-        credentialsId: 'github-token',
-        passwordVariable: 'GIT_PASSWORD',
-        usernameVariable: 'GIT_USERNAME'
-      )]) {
-        def h = GithubHelper.getInstance("${GIT_PASSWORD}", githubData)
-        buildDescription = h.getBuildDescription()
-        prNum = h.getPRNumber().toString()
-        cloneUrl = h.getCloneUrl()
-        prState = h.getPRState()
-        repoName = h.getRepoName()
-        tokenAcquired = true
-      }
-    }
+    // PR/commit metadata + tokenAcquired/stageName/ciImage are hoisted to
+    // script scope (above the Phase 1 podTemplate) so both pods see the
+    // same values; we deliberately do NOT keep a GithubHelper instance
+    // in a long-lived local because the helper holds GHCommitStatus
+    // references (returned by updateCommitStatus) which are not
+    // Serializable -- CPS saves program state on every step boundary
+    // and a single live helper local causes NotSerializableException:
+    // org.kohsuke.github.GHCommitStatus on the next save.
 
     try {
-      currentBuild.description = buildDescription
-
-      stageName = 'Code checkout'
-      stage(stageName) {
-        echo "DIAG: entered ${stageName} body"
-        withCredentials([usernamePassword(
-          credentialsId: 'github-token',
-          passwordVariable: 'GIT_PASSWORD',
-          usernameVariable: 'GIT_USERNAME'
-        )]) {
-          GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Running", GitHubCommitState.PENDING)
-        }
-        echo "DIAG: posted ${stageName} Running status; preparing shallow checkout"
+      // Phase 2 workspace setup: re-checkout the full PR tree (Phase 1
+      // only had ci/ via sparse-checkout). No status post here -- from
+      // the PR's perspective, "Code checkout" already succeeded in
+      // Phase 1; this is an implementation detail of the two-pod
+      // arrangement. We use the same prState branching so the merge
+      // commit / PR head choice stays consistent across phases.
+      stage('Workspace setup') {
+        echo "DIAG: Phase 2 full checkout (no sparse filter)"
         echo "DIAG: prNum=${prNum} prState=${prState}"
         def cloneExtensions = [
           [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
@@ -211,7 +382,7 @@ spec:
         } else {
           error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
         }
-        echo "DIAG: checkout returned"
+        echo "DIAG: Phase 2 checkout returned"
       }
 
       stageName = 'Build'
