@@ -166,8 +166,8 @@ spec:
         # whether it runs inside kaniko at image-build time or inside
         # nova-ci at CI time. nproc inside the container reports the
         # host's CPU count regardless of the cpu limit, so the build
-        # uses -j$(node-nproc) for parallelism but is scheduled with
-        # the 64-CPU ceiling -- net effect: roomy oversubscription
+        # uses make -j<node-nproc> for parallelism but is scheduled
+        # with the 64-CPU ceiling -- net effect: roomy oversubscription
         # without making the build slower.
         memory: 64Gi
         cpu: "64"
