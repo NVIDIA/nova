@@ -154,15 +154,23 @@ spec:
     tty: true
     resources:
       requests:
-        memory: 2Gi
-        cpu: "1"
-      limits:
-        # kaniko's memory usage scales with layer size; the buildroot
-        # pre-build creates a ~6 GiB writable layer (host tools + target
-        # rootfs staging). 16 GiB is comfortably above that with room
-        # for the snapshotter's working set.
         memory: 16Gi
         cpu: "8"
+      limits:
+        # buildroot's host-cmake bootstrap compiles ~600 C++ TUs and
+        # peak RSS easily hits 80+ GiB at -j128 (build #46 OOM-killed
+        # cc1plus in the equivalent stage of the nova-ci pod; build
+        # #70 reproduced it here with a 16 GiB ceiling -- Killed mid-
+        # cmGlobalGenerator.cxx). Match the nova-ci pod's 64 GiB
+        # ceiling so the same buildroot work has the same headroom
+        # whether it runs inside kaniko at image-build time or inside
+        # nova-ci at CI time. nproc inside the container reports the
+        # host's CPU count regardless of the cpu limit, so the build
+        # uses -j$(node-nproc) for parallelism but is scheduled with
+        # the 64-CPU ceiling -- net effect: roomy oversubscription
+        # without making the build slower.
+        memory: 64Gi
+        cpu: "64"
 """
 ) {
   node(POD_LABEL) {
