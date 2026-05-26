@@ -37,6 +37,10 @@
 #   BUILDROOT_TAG       upstream buildroot tag (default: manifest pin).
 #   LINUX_FIRMWARE_GIT_SHA  linux-firmware commit sha (default: manifest pin).
 #   COLOSSUS_VERSION    Colossus CLI version to install (default: manifest pin).
+#   RUN_AS_UID          uid for the in-image `builder` user; matches the
+#                       CI pod's runAsUser so the pre-built buildroot tree
+#                       can be mutated at CI time (default: manifest pin).
+#   RUN_AS_GID          primary gid for `builder` (default: manifest pin).
 #   COLOSSUS_TARBALL    Path to a local copy of colossus_cli_<v>_linux_amd64.tar.gz.
 #                       When set, takes precedence over downloading.
 #   ARTIFACTORY_USER    Artifactory account name (default: $USER).
@@ -109,7 +113,9 @@ manifest_pin() {
 : "${BUILDROOT_TAG:=$(manifest_pin buildroot_tag)}"
 : "${LINUX_FIRMWARE_GIT_SHA:=$(manifest_pin linux_firmware_sha)}"
 : "${COLOSSUS_VERSION:=$(manifest_pin colossus_version)}"
-for v in BUILDROOT_TAG LINUX_FIRMWARE_GIT_SHA COLOSSUS_VERSION; do
+: "${RUN_AS_UID:=$(manifest_pin run_as_uid)}"
+: "${RUN_AS_GID:=$(manifest_pin run_as_gid)}"
+for v in BUILDROOT_TAG LINUX_FIRMWARE_GIT_SHA COLOSSUS_VERSION RUN_AS_UID RUN_AS_GID; do
   if [[ -z "${!v}" ]]; then
     echo "ERROR: ${v} is empty after manifest resolution; check ${MANIFEST}" >&2
     exit 1
@@ -232,6 +238,8 @@ if [[ -n "${STAGE_ONLY_DIR}" ]]; then
   echo "  /kaniko/executor --context=dir://${BUILD_CTX} --dockerfile=${BUILD_CTX}/Dockerfile \\"
   echo "    --build-arg BUILDROOT_TAG=${BUILDROOT_TAG} \\"
   echo "    --build-arg LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA} \\"
+  echo "    --build-arg RUN_AS_UID=${RUN_AS_UID} \\"
+  echo "    --build-arg RUN_AS_GID=${RUN_AS_GID} \\"
   echo "    --destination=${IMAGE}"
   # Emit the resolved image reference on the very last line so callers can
   # grab it with `tail -n1` without parsing log noise above.
@@ -257,6 +265,8 @@ echo "==> docker build --platform ${PLATFORM} -t ${IMAGE}"
   --load \
   --build-arg "BUILDROOT_TAG=${BUILDROOT_TAG}" \
   --build-arg "LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA}" \
+  --build-arg "RUN_AS_UID=${RUN_AS_UID}" \
+  --build-arg "RUN_AS_GID=${RUN_AS_GID}" \
   -t "${IMAGE}" \
   "${BUILD_CTX}"
 

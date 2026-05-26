@@ -14,6 +14,16 @@
 #                                    ci/image-manifest as buildroot_tag).
 #   LINUX_FIRMWARE_GIT_SHA=<sha>   — pin upstream linux-firmware (pinned in
 #                                    ci/image-manifest as linux_firmware_sha).
+#   RUN_AS_UID=<int>               — uid the nova-ci pod runs as at CI time
+#                                    (pinned in ci/image-manifest as
+#                                    run_as_uid). The `builder` user gets
+#                                    this uid so /opt/buildroot-out is
+#                                    owned by the CI runtime — required
+#                                    for buildroot's target-finalize rsync
+#                                    to succeed (utimes() needs owner-or-
+#                                    root, not just write permission).
+#   RUN_AS_GID=<int>               — primary gid for `builder` and the CI
+#                                    pod (pinned as run_as_gid).
 # Optional build-arg:
 #   TAP_SUMMARY_GIT_SHA=<commit>   — pin pcolby/tap-summary summary.gawk.
 #
@@ -34,10 +44,11 @@
 # the Jenkinsfile re-adds ${BUILDROOT_OUT}/modules alongside it before
 # repacking the cpio.
 #
-# The Jenkins pod runs as a non-root NIS uid; toolchains live in system paths
-# or /opt with a+rx, and /opt/buildroot-out is chmod a+rwX so the runtime uid
-# can mutate it via the container's writable upper layer (no NFS, no clock
-# skew, no emptyDir needed).
+# The Jenkins pod runs as a non-root NIS uid (RUN_AS_UID); toolchains live
+# in system paths or /opt with a+rx, and the `builder` account that runs
+# the pre-build is created with that same uid so /opt/buildroot-out is
+# directly owned by the runtime — no chmod gymnastics required and
+# buildroot's target-finalize rsync can update the tree freely.
 
 FROM ubuntu:24.04
 
@@ -176,22 +187,36 @@ RUN set -eux; \
     rm -rf /tmp/lf
 
 # --- Pre-build buildroot in the image ---
-# Buildroot refuses to run as root. Create a builder user, hand it the source
-# tree + a pre-resolved .config from this repo, and run the full make. The
-# pre-built tree contains host tools (host-cmake, host-rust-bin, host-gcc
-# bootstrap, ...) + target packages (busybox, openssh, systemd, avocado, ...)
-# + a complete rootfs.cpio that already has the static overlay (firmware +
-# ssh key + test scripts) baked in. CI runs only repack the cpio after
-# installing the freshly-built kernel modules into /opt/buildroot-out/modules.
+# Buildroot refuses to run as root. Create a `builder` user with the *same*
+# uid the CI pod will run under (RUN_AS_UID, pinned in ci/image-manifest as
+# run_as_uid), hand it the source tree + a pre-resolved .config from this
+# repo, and run the full make. The pre-built tree contains host tools
+# (host-cmake, host-rust-bin, host-gcc bootstrap, ...) + target packages
+# (busybox, openssh, systemd, avocado, ...) + a complete rootfs.cpio that
+# already has the static overlay (firmware + ssh key + test scripts) baked
+# in. CI runs only repack the cpio after installing the freshly-built
+# kernel modules into /opt/buildroot-out/modules.
+#
+# Aligning build-time and run-time uid is what makes the cached tree
+# *mutable* at CI time: buildroot's target-finalize stage rsyncs the
+# updated modules tree into /opt/buildroot-out/target/, and rsync -a's
+# utimes() call requires owner-or-root regardless of mode bits. A merely
+# group-shared, a+rwX tree (build #72) fails with EPERM.
+ARG RUN_AS_UID
+ARG RUN_AS_GID
+RUN test -n "${RUN_AS_UID}" || (echo "ERROR: RUN_AS_UID --build-arg is required (pin lives in ci/image-manifest as run_as_uid)" >&2 && exit 1); \
+    test -n "${RUN_AS_GID}" || (echo "ERROR: RUN_AS_GID --build-arg is required (pin lives in ci/image-manifest as run_as_gid)" >&2 && exit 1)
 COPY buildroot.config /opt/buildroot-out/.config
-# Ubuntu 24.04 already ships a group at GID 30 (`tape`), so we skip
-# `groupadd` and let `useradd -g 30` reference it directly. The CI
-# pod's RUN_AS_GID=30 is what we actually care about; the group's
-# *name* in this image is irrelevant.
+# Ubuntu 24.04 already ships a group at GID 30 (`tape`), so when
+# RUN_AS_GID=30 we skip `groupadd` and let `useradd -g 30` reference
+# the existing group directly. For any other gid we create a group
+# named `cirun` -- the *name* is irrelevant; only the numeric gid
+# matters (it matches the NFS scratch export's gid).
 RUN sed -i 's|^BR2_ROOTFS_OVERLAY=.*|BR2_ROOTFS_OVERLAY="/opt/nova-overlay"|' \
         /opt/buildroot-out/.config \
- && useradd -m -u 9999 -g 30 builder \
- && chown -R builder:30 /opt/buildroot /opt/buildroot-out /opt/nova-overlay
+ && if ! getent group "${RUN_AS_GID}" >/dev/null; then groupadd -g "${RUN_AS_GID}" cirun; fi \
+ && useradd -m -u "${RUN_AS_UID}" -g "${RUN_AS_GID}" builder \
+ && chown -R "${RUN_AS_UID}:${RUN_AS_GID}" /opt/buildroot /opt/buildroot-out /opt/nova-overlay
 # /opt/nova-overlay is chowned to builder so buildroot's rsync (which runs
 # as builder) can read into /root/.ssh -- that dir is mode 0700 to satisfy
 # sshd on the target. The mode bits are preserved verbatim by rsync; the
@@ -204,12 +229,6 @@ RUN make O=/opt/buildroot-out olddefconfig \
  && make O=/opt/buildroot-out -j"$(nproc)"
 USER root
 WORKDIR /workspace
-
-# Make the pre-built tree mutable by any uid: CI runs as a NIS uid (e.g.
-# 150707) and must be able to write modules + rootfs.cpio into the container's
-# writable upper layer. /opt/nova-overlay stays read-mostly (overlay rsync
-# only reads), but be permissive in case a future change writes to it.
-RUN chmod -R a+rwX /opt/buildroot-out /opt/nova-overlay
 
 # Colossus CLI is internal and added on top by ci/build-image.sh:
 #   COPY --chmod=0755 colossus /usr/local/bin/colossus

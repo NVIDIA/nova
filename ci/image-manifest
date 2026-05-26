@@ -41,6 +41,19 @@ linux_firmware_sha=adb6dceb45b98c4149e1ce68fc1a5f394fd67695
 # folder at the URL above and update this pin.
 colossus_version=2.3.0
 
+# Runtime NIS uid/gid the nova-ci container will run under at CI time
+# (Phase 2 podSpec runAsUser/runAsGroup, also the owner of the NFS
+# /scratch export). The Dockerfile creates the `builder` user with
+# this exact uid/gid so the buildroot pre-build at image-build time
+# owns the resulting tree under /opt/buildroot-out -- otherwise CI
+# runs hit EPERM on rsync's utimes() when buildroot's target-finalize
+# stage updates the tree with freshly-built kernel modules (group
+# membership + a+rwX is not enough: utimes requires owner-or-root).
+# Pinning here means a fork that needs a different uid (different NIS
+# user) gets its own content-addressed image automatically.
+run_as_uid=150707
+run_as_gid=30
+
 # --- In-tree hash inputs (paths relative to ci/) ---
 # Anything that affects the image's content but isn't an external pin
 # goes here. Order doesn't matter; the hash script sorts.

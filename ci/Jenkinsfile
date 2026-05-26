@@ -13,7 +13,11 @@
 // - Shared scratch on NFS (ccache only): follow Blossom how-to (NIS uid/gid + nfs volume):
 //   https://nvidia.atlassian.net/wiki/spaces/BLOS/pages/2147264305/NFS+scratch+space+for+Blossom+Jenkins+job
 //   Export: ipp1-cdot01-col01:/vol/scratch1/scratch.epeer_blossom → mountPath /scratch
-//   Set job parameters RUN_AS_UID / RUN_AS_GID from `id` on a Linux host (same as wiki Step 3–4).
+//   Runtime uid/gid (matching the NFS export owner) are pinned in
+//   ci/image-manifest as run_as_uid / run_as_gid -- they are part of the
+//   image's content address. Bumping them in the manifest rebuilds the
+//   image with a `builder` user at the new uid and re-runs the pod with
+//   matching runAsUser/runAsGroup.
 // - TAP summary: GNU gawk + /usr/local/share/nova-ci/tap-summary.gawk (from ci/Dockerfile).
 // - CI image: see ci/Dockerfile — clang/llvm, ccache, make, git, colossus CLI (add in private layer),
 //   jq, curl, openssh-client, Rust-for-Linux (rustup nightly + rust-src / rustfmt / clippy), etc.
@@ -57,8 +61,15 @@ import ipp.blossom.*
 
 properties([
   parameters([
-    string(name: 'RUN_AS_UID', defaultValue: '150707', description: 'NIS uid for pod + NFS /scratch (Blossom scratch how-to); override if not epeer'),
-    string(name: 'RUN_AS_GID', defaultValue: '30', description: 'Primary NIS gid for pod + NFS /scratch; override if your export differs'),
+    // RUN_AS_UID / RUN_AS_GID used to live here; they are now pinned in
+    // ci/image-manifest as run_as_uid / run_as_gid and read at the start
+    // of Phase 1. That makes them part of the image's content address:
+    // the in-image `builder` user is created with the same uid/gid the
+    // CI pod runs under, so /opt/buildroot-out is owned by the runtime
+    // and buildroot's target-finalize rsync can mutate it. Decoupling
+    // these from a per-build override prevents a class of EPERM bugs
+    // (build #72) where a user-supplied uid no longer matched the
+    // baked-in tree.
     string(name: 'ANSIBLE_GIT_URL', defaultValue: 'https://gitlab-master.nvidia.com/epeer/nova-test.git', description: 'Git URL passed to colossus bm lease -agu (Ansible playbooks)'),
     string(name: 'ANSIBLE_GIT_BRANCH', defaultValue: 'main', description: 'Branch for -agb (playbook / lease metadata; epeer/nova-test on GitLab)'),
     string(name: 'ANSIBLE_PLAYBOOK', defaultValue: 'target.yml', description: 'Playbook path in repo for -apb'),
@@ -99,11 +110,14 @@ String repoName = ''
 boolean tokenAcquired = false
 def stageName = ''
 
-def runUid = params.RUN_AS_UID?.trim()
-def runGid = params.RUN_AS_GID?.trim()
-if (!runUid || !runGid) {
-  error('Set job parameters RUN_AS_UID and RUN_AS_GID to your NIS uid/gid from `id` (see Blossom NFS scratch how-to).')
-}
+// Runtime uid/gid for the nova-ci container, resolved from ci/image-manifest
+// inside Phase 1 (after the sparse checkout). Declared at script scope so
+// the Phase 2 podTemplate GString -- which references them as
+// ${runUid.toInteger()} / ${runGid.toInteger()} and is evaluated when
+// Phase 2's podTemplate(...) call site is reached, after Phase 1's node
+// block has completed -- picks up the resolved values.
+String runUid = ''
+String runGid = ''
 
 // Status updates are inlined per call site (was: postCommitStatus helper method): build #37 had
 // an empty Code checkout stage body and never reached Build or the catch block -- the CPS-
@@ -139,8 +153,11 @@ spec:
   - name: jnlp
     command: ["/bin/sh", "-c"]
     args: ["umask 0002 && exec /usr/local/bin/jenkins-agent"]
-    securityContext:
-      runAsGroup: ${runGid.toInteger()}
+    # No runAsGroup override here: Phase 1 only does the ci/ sparse
+    # checkout + staging of the kaniko build context. There is no NFS
+    # mount and no nova-ci container sharing the workspace, so jnlp's
+    # default (image-supplied) uid/gid is sufficient. The runtime
+    # uid/gid pinned in ci/image-manifest only takes effect in Phase 2.
     resources:
       requests:
         memory: 1Gi
@@ -235,6 +252,20 @@ spec:
         ]
         echo "DIAG: Phase 1 trunk (nova-test) ci/ checkout returned"
         sh 'ls -la ci/'
+
+        // Pull the runtime uid/gid out of the manifest so Phase 2's pod
+        // spec uses the exact same values that the in-image `builder`
+        // user was created with. The image is content-addressed against
+        // the manifest, so a mismatch is impossible by construction --
+        // bumping run_as_uid / run_as_gid invalidates the cache and the
+        // rebuilt image owns /opt/buildroot-out with the new uid/gid.
+        Map manifestPins = parseManifestPins()
+        if (!(manifestPins.run_as_uid ==~ /[0-9]+/) || !(manifestPins.run_as_gid ==~ /[0-9]+/)) {
+          error("ci/image-manifest: run_as_uid / run_as_gid must be positive integers; got '${manifestPins.run_as_uid}' / '${manifestPins.run_as_gid}'")
+        }
+        runUid = manifestPins.run_as_uid
+        runGid = manifestPins.run_as_gid
+        echo "Phase 1 resolved runUid:runGid = ${runUid}:${runGid} (from ci/image-manifest)"
 
         ciImage = ensureImage([:])
         echo "Phase 1 resolved ciImage = ${ciImage}"
@@ -1014,8 +1045,12 @@ def ensureImage(Map opts) {
 
   Map pins = parseManifestPins()
   echo "imageBuild: manifest pins = ${pins}"
-  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version'].each { k ->
+  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version',
+   'run_as_uid', 'run_as_gid'].each { k ->
     if (!pins[k]) error("imageBuild: ci/image-manifest is missing required pin '${k}'")
+  }
+  if (!(pins.run_as_uid ==~ /[0-9]+/) || !(pins.run_as_gid ==~ /[0-9]+/)) {
+    error("imageBuild: run_as_uid / run_as_gid must be non-negative integers; got '${pins.run_as_uid}' / '${pins.run_as_gid}'")
   }
 
   // Probe inside withCredentials so the bearer-token exchange has
@@ -1075,6 +1110,8 @@ def ensureImage(Map opts) {
           --destination='${imageFull}' \\
           --build-arg BUILDROOT_TAG=${pins.buildroot_tag} \\
           --build-arg LINUX_FIRMWARE_GIT_SHA=${pins.linux_firmware_sha} \\
+          --build-arg RUN_AS_UID=${pins.run_as_uid} \\
+          --build-arg RUN_AS_GID=${pins.run_as_gid} \\
           --snapshot-mode=redo \\
           --use-new-run \\
           --cleanup \\
