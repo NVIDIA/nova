@@ -54,7 +54,8 @@
 #   PLATFORM            target platform (default: linux/amd64; Blossom k8s
 #                       nodes are x86_64). On Apple Silicon hosts this triggers
 #                       QEMU cross-build via buildx (slow + flaky; see #67 --
-#                       prefer ci/Jenkinsfile.image + kaniko on a real x86 node).
+#                       prefer pushing to nova-test and letting the main
+#                       pipeline's Phase 1 kaniko build run on a real x86 node).
 
 set -euo pipefail
 
@@ -257,8 +258,9 @@ echo "==> docker build --platform ${PLATFORM} -t ${IMAGE}"
 # Caveat: QEMU-emulated kbuild in the buildroot pre-build step trips a known
 # GNU-make jobserver inheritance bug in linux-headers' headers_install
 # `__sub-make` -- the build dies with "write jobserver: Bad file descriptor"
-# after ~3 hours of host-tools compile. For reliable image builds, drive
-# ci/Jenkinsfile.image (kaniko on a real x86 Linux node) instead.
+# after ~3 hours of host-tools compile. For reliable image builds, push to
+# nova-test and let the main pipeline's Phase 1 stage kaniko-build the image
+# on a real x86 Linux node instead.
 "${DOCKER}" buildx build \
   --pull \
   --platform "${PLATFORM}" \
