@@ -250,9 +250,6 @@ spec:
             refspec: '+refs/heads/nova-test:refs/remotes/origin/nova-test'
           ]]
         ]
-        echo "DIAG: Phase 1 trunk (nova-test) ci/ checkout returned"
-        sh 'ls -la ci/'
-
         // Pull the runtime uid/gid out of the manifest so Phase 2's pod
         // spec uses the exact same values that the in-image `builder`
         // user was created with. The image is content-addressed against
@@ -265,10 +262,10 @@ spec:
         }
         runUid = manifestPins.run_as_uid
         runGid = manifestPins.run_as_gid
-        echo "Phase 1 resolved runUid:runGid = ${runUid}:${runGid} (from ci/image-manifest)"
 
-        ciImage = ensureImage([:])
-        echo "Phase 1 resolved ciImage = ${ciImage}"
+        // Resolve (build on a cache miss) the agent image from those pins.
+        ciImage = ensureImage(manifestPins)
+        echo "Phase 1 resolved ciImage = ${ciImage} (runUid:runGid ${runUid}:${runGid})"
       }
     } catch (Exception ex) {
       currentBuild.result = 'FAILURE'
@@ -281,7 +278,6 @@ spec:
             usernameVariable: 'GIT_USERNAME'
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
-            echo "DIAG: posted ${stageName} Failed status (Phase 1)"
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status: ${ignored}"
@@ -376,8 +372,6 @@ spec:
       // arrangement. We use the same prState branching so the merge
       // commit / PR head choice stays consistent across phases.
       stage('Workspace setup') {
-        echo "DIAG: Phase 2 full checkout (no sparse filter)"
-        echo "DIAG: prNum=${prNum} prState=${prState}"
         def cloneExtensions = [
           [$class: 'CloneOption', shallow: true, depth: 1, noTags: true, honorRefspec: true, timeout: 30],
         ]
@@ -406,7 +400,6 @@ spec:
         } else {
           error("PR state '${prState}' is neither Open nor Merged; nothing to check out.")
         }
-        echo "DIAG: Phase 2 checkout returned"
       }
 
       stageName = 'Build'
@@ -453,7 +446,7 @@ spec:
             'BUILDROOT_OUT=/opt/buildroot-out',
           ]) {
             sh '''
-              set -eux
+              set -eu
               mkdir -p "${CCACHE_DIR}" "${BUILDROOT_OUT}/modules"
               export KBUILD_BUILD_TIMESTAMP=''
               # Re-write BR2_ROOTFS_OVERLAY to include the per-build
@@ -577,7 +570,7 @@ spec:
             //   script.sh.copy: 8: Syntax error: "(" unexpected
             // ).
             sh '''#!/bin/bash
-              set -euxo pipefail
+              set -euo pipefail
 
               # colossus bm lease list -j returns exit code 1 when the lease
               # set is empty (like grep -- "no results" treated as failure)
@@ -674,19 +667,7 @@ spec:
             keyFileVariable: 'SSH_KEY_SRC',
             usernameVariable: 'SSH_USER'
           )]) {
-          container('jnlp') {
-            // /home/jenkins/agent is the workspace volume, shared with
-            // nova-ci. Copy the key contents (jnlp has read access since
-            // it is the cred file owner) to a known path mode 0640 so
-            // group 30 (which both containers run as) can read it.
-            sh '''
-              set -eux
-              mkdir -p /home/jenkins/agent/.ssh-stage
-              chmod 0750 /home/jenkins/agent/.ssh-stage
-              cat "${SSH_KEY_SRC}" > /home/jenkins/agent/.ssh-stage/key
-              chmod 0640 /home/jenkins/agent/.ssh-stage/key
-            '''
-          }
+          stageSshKey()
           withEnv([
             // Same path as the Build stage: /opt/buildroot-out lives in
             // the container's writable upper layer (pod-local COW), and
@@ -706,7 +687,7 @@ spec:
             'NSS_WRAPPER_GROUP=/home/jenkins/agent/nss-group',
           ]) {
           sh '''
-            set -eux
+            set -eu
             printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
             printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
             # Copy the jnlp-staged (0640, group 30) key into a private
@@ -778,15 +759,7 @@ spec:
             keyFileVariable: 'SSH_KEY_SRC',
             usernameVariable: 'SSH_USER'
           )]) {
-          container('jnlp') {
-            sh '''
-              set -eux
-              mkdir -p /home/jenkins/agent/.ssh-stage
-              chmod 0750 /home/jenkins/agent/.ssh-stage
-              cat "${SSH_KEY_SRC}" > /home/jenkins/agent/.ssh-stage/key
-              chmod 0640 /home/jenkins/agent/.ssh-stage/key
-            '''
-          }
+          stageSshKey()
           withEnv([
             // ssh needs getpwuid() to resolve our NIS uid; see comment in
             // Deploy stage. /home/jenkins/agent persists across containers
@@ -799,7 +772,7 @@ spec:
             'NSS_WRAPPER_GROUP=/home/jenkins/agent/nss-group',
           ]) {
             sh '''
-              set -eux
+              set -eu
               if [ ! -f "${NSS_WRAPPER_PASSWD}" ]; then
                 printf 'ciuser:x:%s:%s::%s:/bin/bash\n' "$(id -u)" "$(id -g)" "${HOME}" > "${NSS_WRAPPER_PASSWD}"
                 printf 'cigroup:x:%s:\n' "$(id -g)" > "${NSS_WRAPPER_GROUP}"
@@ -966,7 +939,6 @@ spec:
         usernameVariable: 'GIT_USERNAME'
       )]) {
         GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
-        echo "DIAG: posted Complete SUCCESS status"
       }
 
     } catch (Exception ex) {
@@ -980,7 +952,6 @@ spec:
             usernameVariable: 'GIT_USERNAME'
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
-            echo "DIAG: posted ${stageName} Failed status"
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status: ${ignored}"
@@ -1010,6 +981,30 @@ spec:
 }
 
 // ============================================================================
+// Helper used by Phase 2's Deploy + Test stages.
+// ----------------------------------------------------------------------------
+// Stage the nova-ssh-key credential where the nova-ci uid can read it.
+// The sshUserPrivateKey binding writes the key as the jnlp agent uid
+// (1000) at mode 0600 inside a 0700 dir, so nova-ci (a different NIS uid)
+// can't read it directly. Copy it via jnlp into the shared workspace
+// volume at 0640 group 30; the caller then `install -m 0600` a private
+// copy it owns (ssh's UNPROTECTED-KEY check wants 0600). Must be called
+// inside withCredentials([sshUserPrivateKey(... keyFileVariable:
+// 'SSH_KEY_SRC' ...)]) so $SSH_KEY_SRC is bound.
+// ============================================================================
+def stageSshKey() {
+  container('jnlp') {
+    sh '''
+      set -eu
+      mkdir -p /home/jenkins/agent/.ssh-stage
+      chmod 0750 /home/jenkins/agent/.ssh-stage
+      cat "${SSH_KEY_SRC}" > /home/jenkins/agent/.ssh-stage/key
+      chmod 0640 /home/jenkins/agent/.ssh-stage/key
+    '''
+  }
+}
+
+// ============================================================================
 // Helpers used by Phase 1's "Ensure agent image" stage.
 // ----------------------------------------------------------------------------
 // These are NOT part of the image hash (ci/hash-inputs.sh covers only the
@@ -1026,11 +1021,19 @@ spec:
 //
 // Caller must be inside a podTemplate with `jnlp` (for the bash + curl +
 // kaniko-context-staging) and `kaniko` (only invoked on a cache miss).
-def ensureImage(Map opts) {
-  String registry          = opts.registry          ?: 'gitlab-master.nvidia.com:5005'
-  String repo              = opts.repo              ?: 'epeer/nova-test/nova-kernel-ci'
-  String gitlabCredId      = opts.gitlabCredId      ?: 'gitlab_epeer'
-  String artifactoryCredId = opts.artifactoryCredId ?: 'artifactory-token'
+def ensureImage(Map pins) {
+  String registry          = 'gitlab-master.nvidia.com:5005'
+  String repo              = 'epeer/nova-test/nova-kernel-ci'
+  String gitlabCredId      = 'gitlab_epeer'
+  String artifactoryCredId = 'artifactory-token'
+
+  // pins were parsed + format-validated by the caller (Phase 1). Here we
+  // only assert that every pin the image build consumes is present.
+  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version',
+   'run_as_uid', 'run_as_gid'].each { k ->
+    if (!pins[k]) error("imageBuild: ci/image-manifest is missing required pin '${k}'")
+  }
+  echo "imageBuild: manifest pins = ${pins}"
 
   // Hash via ci/hash-inputs.sh -- single source of truth for the
   // algorithm. The Jenkinsfile never re-implements the hash.
@@ -1042,16 +1045,6 @@ def ensureImage(Map opts) {
   String imageFull = "${registry}/${repo}:${tag}"
   echo "imageBuild: computed tag = ${tag}"
   echo "imageBuild: target image = ${imageFull}"
-
-  Map pins = parseManifestPins()
-  echo "imageBuild: manifest pins = ${pins}"
-  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version',
-   'run_as_uid', 'run_as_gid'].each { k ->
-    if (!pins[k]) error("imageBuild: ci/image-manifest is missing required pin '${k}'")
-  }
-  if (!(pins.run_as_uid ==~ /[0-9]+/) || !(pins.run_as_gid ==~ /[0-9]+/)) {
-    error("imageBuild: run_as_uid / run_as_gid must be non-negative integers; got '${pins.run_as_uid}' / '${pins.run_as_gid}'")
-  }
 
   // Probe inside withCredentials so the bearer-token exchange has
   // basic-auth available. On a cache hit we exit here.
@@ -1078,17 +1071,17 @@ def ensureImage(Map opts) {
       usernameVariable: 'ARTIFACTORY_USER',
       passwordVariable: 'ARTIFACTORY_TOKEN')]) {
     sh """
-      set -eux
+      set -eu
       rm -rf '${ctx}'
-      COLOSSUS_VERSION='${pins.colossus_version}' \\
-        ci/build-image.sh --stage-only '${ctx}' --tag '${tag}'
+      ci/build-image.sh --stage-only '${ctx}' --tag '${tag}'
       ls -la '${ctx}'
     """
   }
 
   // Run kaniko. config.json is synthesized at runtime from the
   // gitlab_epeer cred (basic-auth-over-https against the GitLab
-  // registry); `set +x` keeps the token out of the build log.
+  // registry); the derived base64 auth is written under a stderr-
+  // suppressed group so it can't leak into the log.
   container('kaniko') {
     withCredentials([usernamePassword(
         credentialsId: gitlabCredId,
@@ -1097,13 +1090,15 @@ def ensureImage(Map opts) {
       sh """#!/busybox/sh
         set -eu
         mkdir -p /kaniko/.docker
+        # base64(user:token) is a derived value Jenkins does NOT mask, so
+        # write it inside a stderr-suppressed group. This block runs under
+        # a shebang (no Jenkins default -x) and adds no -x of its own, so
+        # there is no trace anyway -- the redirect is belt-and-suspenders.
         {
-          set +x
           AUTH_B64=\$(printf '%s:%s' "\$GITLAB_USER" "\$GITLAB_TOKEN" | base64 | tr -d '\\n')
           printf '{"auths":{"${registry}":{"auth":"%s"}}}\\n' "\$AUTH_B64" > /kaniko/.docker/config.json
         } 2>/dev/null
         chmod 0600 /kaniko/.docker/config.json
-        set -x
         /kaniko/executor \\
           --context=dir://${ctx} \\
           --dockerfile=${ctx}/Dockerfile \\
