@@ -1165,9 +1165,15 @@ boolean imageTagExists(String registry, String repo, String tag) {
     set +x  # don't leak GITLAB_TOKEN into the log
 
     URL='https://${registry}/v2/${repo}/manifests/${tag}'
+    # GitLab's registry answers 404 for a manifest requested without an
+    # Accept matching its stored media type (kaniko pushes OCI/v2 with no
+    # schema1 fallback). Negotiate every modern type so an existing tag
+    # returns 200 instead of a false 404 -> a needless image rebuild.
+    ACCEPT='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
 
     # 1. Anonymous HEAD. Capture WWW-Authenticate from the 401.
-    code=\$(curl -sS -o /dev/null -w '%{http_code}' -I "\${URL}" -D /tmp/probe.headers || true)
+    code=\$(curl -sS -o /dev/null -w '%{http_code}' -I \\
+      -H "\${ACCEPT}" "\${URL}" -D /tmp/probe.headers || true)
     if [ "\${code}" = '200' ]; then
       echo 'probe: anonymous 200 (public)' >&2
       exit 0
@@ -1202,6 +1208,7 @@ boolean imageTagExists(String registry, String repo, String tag) {
 
     # 4. Authed HEAD.
     auth_code=\$(curl -sS -o /dev/null -w '%{http_code}' -I \\
+      -H "\${ACCEPT}" \\
       -H "Authorization: Bearer \${token}" "\${URL}")
     echo "probe: authed HEAD -> \${auth_code}" >&2
     case "\${auth_code}" in
