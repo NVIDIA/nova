@@ -278,6 +278,12 @@ spec:
             usernameVariable: 'GIT_USERNAME'
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            // Load-bearing trailing step: updateCommitStatus returns a
+            // non-serializable GHCommitStatus; this null-returning echo
+            // clears it from the closure's CPS value slot so the next
+            // saveProgram doesn't die with NotSerializableException. Do
+            // not remove (see the Phase 2 success note for the mechanism).
+            echo "Posted '${stageName} Failed' status (Phase 1)"
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status: ${ignored}"
@@ -939,6 +945,7 @@ spec:
         usernameVariable: 'GIT_USERNAME'
       )]) {
         GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", 'Complete', GitHubCommitState.SUCCESS)
+        echo 'Posted final Complete/SUCCESS commit status'
       }
 
     } catch (Exception ex) {
@@ -952,6 +959,10 @@ spec:
             usernameVariable: 'GIT_USERNAME'
           )]) {
             GithubHelper.getInstance("${GIT_PASSWORD}", githubData).updateCommitStatus("${BUILD_URL}", "${stageName} Failed", GitHubCommitState.FAILURE)
+            // Load-bearing trailing step -- see the Phase 2 success note
+            // above; clears the non-serializable GHCommitStatus from the
+            // CPS value slot so the next saveProgram doesn't crash.
+            echo "Posted '${stageName} Failed' status"
           }
         } catch (Exception ignored) {
           echo "Could not update GitHub status: ${ignored}"
