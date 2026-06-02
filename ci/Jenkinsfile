@@ -702,29 +702,13 @@ spec:
             # ssh's UNPROTECTED PRIVATE KEY FILE check is happy.
             install -m 0600 /home/jenkins/agent/.ssh-stage/key /home/jenkins/agent/ssh-key
             SSH_KEY=/home/jenkins/agent/ssh-key
-            # Build #59 hit "ssh: connect to host 10.46.64.24 port 22:
-            # No route to host" -- a dead Ampere host masquerading as a
-            # routing problem (verified out-of-band via SSA-authenticated
-            # ping/colossus bm host coldreboot/reprovision on 2026-05-20).
-            # Keep the diagnostic in tree so future flakes surface
-            # cheaply: /proc/net/route + per-lease TCP/22 probes via the
-            # bash /dev/tcp builtin (image lacks iproute2 and netcat).
-            echo "==== Deploy connectivity diagnostics ===="
-            echo "---- /proc/net/route ----"
-            cat /proc/net/route || true
-            echo "---- /etc/resolv.conf ----"
-            cat /etc/resolv.conf || true
-            echo "---- per-lease reachability (TCP 22, 5s timeout) ----"
-            while IFS= read -r TARGET; do
-              IP=$(echo "${TARGET}" | cut -d, -f3)
-              ARCH=$(echo "${TARGET}" | cut -d, -f5)
-              if timeout 5 bash -c "exec 3<>/dev/tcp/${IP}/22 && exec 3>&-" 2>&1; then
-                echo "${ARCH} @ ${IP}:22 -- reachable"
-              else
-                echo "${ARCH} @ ${IP}:22 -- UNREACHABLE (exit $?)"
-              fi
-            done < leases.txt
-            echo "==== end diagnostics ===="
+            # A dead leased host (build #59: an Ampere box stuck at "No
+            # route to host" after a flaky bm reboot) surfaces here as the
+            # scp below failing under set -eu, which fails the Deploy stage
+            # loudly. We used to print /proc/net/route + resolv.conf + a
+            # per-lease TCP/22 reachability dump first; dropped as console
+            # noise -- the scp error already localizes a dead host (just
+            # after ConnectTimeout below rather than a fast 5s probe).
             SSH_OPTS="-i ${SSH_KEY} -o IdentitiesOnly=yes -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=300 -o ServerAliveInterval=2 -o ServerAliveCountMax=1"
             BZIMAGE="${WORKSPACE}/arch/x86_64/boot/bzImage"
             INITRD="${BUILDROOT_OUT}/images/rootfs.cpio"
@@ -1085,7 +1069,6 @@ def ensureImage(Map pins) {
       set -eu
       rm -rf '${ctx}'
       ci/build-image.sh --stage-only '${ctx}' --tag '${tag}'
-      ls -la '${ctx}'
     """
   }
 
