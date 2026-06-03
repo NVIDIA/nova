@@ -41,6 +41,12 @@ linux_firmware_sha=adb6dceb45b98c4149e1ce68fc1a5f394fd67695
 # folder at the URL above and update this pin.
 colossus_version=2.3.0
 
+# TAP summary formatter (pcolby/tap-summary, MIT). summary.gawk is fetched
+# from raw.githubusercontent.com at this commit inside the Dockerfile and
+# installed to /usr/local/share/nova-ci/tap-summary.gawk. Bump to pull a
+# newer formatter; pinning keeps the agent image reproducible.
+tap_summary_sha=ec9de3f6393083dd89052d519a23b2999a75be9b
+
 # Runtime NIS uid/gid the nova-ci container will run under at CI time
 # (Phase 2 podSpec runAsUser/runAsGroup, also the owner of the NFS
 # /scratch export). The Dockerfile creates the `builder` user with

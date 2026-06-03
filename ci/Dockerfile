@@ -24,8 +24,9 @@
 #                                    root, not just write permission).
 #   RUN_AS_GID=<int>               — primary gid for `builder` and the CI
 #                                    pod (pinned as run_as_gid).
-# Optional build-arg:
-#   TAP_SUMMARY_GIT_SHA=<commit>   — pin pcolby/tap-summary summary.gawk.
+#   TAP_SUMMARY_GIT_SHA=<commit>   — pin pcolby/tap-summary summary.gawk
+#                                    (pinned in ci/image-manifest as
+#                                    tap_summary_sha).
 #
 # Buildroot *sources* live in /opt/buildroot; the build is pre-staged in the
 # image at /opt/buildroot-out (host + target packages, rootfs staging, etc.).
@@ -102,7 +103,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # TAP summary script (pcolby/tap-summary, MIT): fetch at image build so agents need no runtime download.
 # Upstream: https://github.com/pcolby/tap-summary
-ARG TAP_SUMMARY_GIT_SHA=ec9de3f6393083dd89052d519a23b2999a75be9b
+# Required build-arg from ci/image-manifest (tap_summary_sha=). No default,
+# like the other pins: a missing --build-arg fails the build loudly rather
+# than silently baking in a stale formatter commit.
+ARG TAP_SUMMARY_GIT_SHA
+RUN test -n "${TAP_SUMMARY_GIT_SHA}" || (echo "ERROR: TAP_SUMMARY_GIT_SHA --build-arg is required (pin lives in ci/image-manifest as tap_summary_sha)" >&2 && exit 1)
 RUN mkdir -p /usr/local/share/nova-ci \
     && curl -fsSL -o /usr/local/share/nova-ci/tap-summary.gawk \
         "https://raw.githubusercontent.com/pcolby/tap-summary/${TAP_SUMMARY_GIT_SHA}/summary.gawk" \
@@ -174,7 +179,7 @@ RUN chmod 0700 /opt/nova-overlay/root/.ssh \
 # value: bumping the manifest pin is the only supported way to refresh the
 # firmware blobs in the agent image. Image build fails closed without it.
 ARG LINUX_FIRMWARE_GIT_SHA
-RUN set -eux; \
+RUN set -eu; \
     test -n "${LINUX_FIRMWARE_GIT_SHA}" || (echo "ERROR: LINUX_FIRMWARE_GIT_SHA --build-arg is required (pin lives in ci/image-manifest)" >&2 && exit 1); \
     git clone --no-checkout --no-tags --filter=blob:none --sparse \
         https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
@@ -233,5 +238,3 @@ WORKDIR /workspace
 # Colossus CLI is internal and added on top by ci/build-image.sh:
 #   COPY --chmod=0755 colossus /usr/local/bin/colossus
 # The Jenkinsfile expects `colossus` on PATH for Provision.
-
-WORKDIR /workspace

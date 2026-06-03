@@ -24,18 +24,20 @@
 #       into DIR, ready for `kaniko --context=dir://DIR --dockerfile=DIR/Dockerfile`.
 #       Skips the `docker buildx build`, the smoke check, and the push.
 #
-# Pin resolution: BUILDROOT_TAG, LINUX_FIRMWARE_GIT_SHA, COLOSSUS_VERSION
-# default to the values pinned in ci/image-manifest. They can be overridden
-# via environment variable when iterating locally (e.g. to test a newer
-# linux-firmware sha before updating the pin). The first two are also passed
-# through as --build-arg to docker buildx; the third drives the colossus
-# tarball download and the private-layer COPY in the generated Dockerfile.
+# Pin resolution: BUILDROOT_TAG, LINUX_FIRMWARE_GIT_SHA, TAP_SUMMARY_GIT_SHA,
+# COLOSSUS_VERSION, RUN_AS_UID and RUN_AS_GID default to the values pinned in
+# ci/image-manifest. They can be overridden via environment variable when
+# iterating locally (e.g. to test a newer linux-firmware sha before updating
+# the pin). All but COLOSSUS_VERSION are passed through as --build-arg to
+# docker buildx / kaniko; COLOSSUS_VERSION instead drives the colossus tarball
+# download and the private-layer COPY in the generated Dockerfile.
 #
 # Environment overrides:
 #   REGISTRY            gitlab-master.nvidia.com:5005
 #   REPO                epeer/nova-test/nova-kernel-ci
 #   BUILDROOT_TAG       upstream buildroot tag (default: manifest pin).
 #   LINUX_FIRMWARE_GIT_SHA  linux-firmware commit sha (default: manifest pin).
+#   TAP_SUMMARY_GIT_SHA pcolby/tap-summary summary.gawk commit (default: manifest pin).
 #   COLOSSUS_VERSION    Colossus CLI version to install (default: manifest pin).
 #   RUN_AS_UID          uid for the in-image `builder` user; matches the
 #                       CI pod's runAsUser so the pre-built buildroot tree
@@ -78,7 +80,11 @@ while [[ $# -gt 0 ]]; do
     --stage-only)   STAGE_ONLY_DIR="$2"; shift 2 ;;
     --stage-only=*) STAGE_ONLY_DIR="${1#--stage-only=}"; shift ;;
     -h|--help)
-      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the leading comment header (everything from the line after the
+      # shebang down to the first non-comment line), stripping the "# " prefix.
+      # Driven off the comment block itself so it can't drift out of sync with
+      # the header's length the way a hardcoded line range did.
+      awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} /^[[:space:]]*$/{print;next} {exit}' "$0"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -113,10 +119,11 @@ manifest_pin() {
 }
 : "${BUILDROOT_TAG:=$(manifest_pin buildroot_tag)}"
 : "${LINUX_FIRMWARE_GIT_SHA:=$(manifest_pin linux_firmware_sha)}"
+: "${TAP_SUMMARY_GIT_SHA:=$(manifest_pin tap_summary_sha)}"
 : "${COLOSSUS_VERSION:=$(manifest_pin colossus_version)}"
 : "${RUN_AS_UID:=$(manifest_pin run_as_uid)}"
 : "${RUN_AS_GID:=$(manifest_pin run_as_gid)}"
-for v in BUILDROOT_TAG LINUX_FIRMWARE_GIT_SHA COLOSSUS_VERSION RUN_AS_UID RUN_AS_GID; do
+for v in BUILDROOT_TAG LINUX_FIRMWARE_GIT_SHA TAP_SUMMARY_GIT_SHA COLOSSUS_VERSION RUN_AS_UID RUN_AS_GID; do
   if [[ -z "${!v}" ]]; then
     echo "ERROR: ${v} is empty after manifest resolution; check ${MANIFEST}" >&2
     exit 1
@@ -218,7 +225,7 @@ fi
     echo "# --- private layer: colossus CLI ${COLOSSUS_VER} (PyInstaller bundle) ---"
     echo "# Tarball contains a colossus-cli/ directory with colossus + _internal/."
     echo "COPY colossus-cli.tar.gz /tmp/colossus-cli.tar.gz"
-    echo "RUN set -eux; \\"
+    echo "RUN set -eu; \\"
     echo "    mkdir -p /opt; \\"
     echo "    tar -xzf /tmp/colossus-cli.tar.gz -C /opt; \\"
     echo "    chmod -R a+rX /opt/colossus-cli; \\"
@@ -239,6 +246,7 @@ if [[ -n "${STAGE_ONLY_DIR}" ]]; then
   echo "  /kaniko/executor --context=dir://${BUILD_CTX} --dockerfile=${BUILD_CTX}/Dockerfile \\"
   echo "    --build-arg BUILDROOT_TAG=${BUILDROOT_TAG} \\"
   echo "    --build-arg LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA} \\"
+  echo "    --build-arg TAP_SUMMARY_GIT_SHA=${TAP_SUMMARY_GIT_SHA} \\"
   echo "    --build-arg RUN_AS_UID=${RUN_AS_UID} \\"
   echo "    --build-arg RUN_AS_GID=${RUN_AS_GID} \\"
   echo "    --destination=${IMAGE}"
@@ -267,6 +275,7 @@ echo "==> docker build --platform ${PLATFORM} -t ${IMAGE}"
   --load \
   --build-arg "BUILDROOT_TAG=${BUILDROOT_TAG}" \
   --build-arg "LINUX_FIRMWARE_GIT_SHA=${LINUX_FIRMWARE_GIT_SHA}" \
+  --build-arg "TAP_SUMMARY_GIT_SHA=${TAP_SUMMARY_GIT_SHA}" \
   --build-arg "RUN_AS_UID=${RUN_AS_UID}" \
   --build-arg "RUN_AS_GID=${RUN_AS_GID}" \
   -t "${IMAGE}" \
@@ -308,8 +317,9 @@ if [[ "${PUSH}" -eq 1 ]]; then
   "${DOCKER}" push "${IMAGE}"
   echo
   echo "Pushed ${IMAGE}"
-  echo "Bump Jenkinsfile CI_IMAGE default (or pass it via Build with Parameters):"
-  echo "  ${IMAGE}"
+  echo "The main pipeline auto-discovers this tag: Phase 1 hashes ci/image-manifest"
+  echo "+ inputs and, on its next run for these same inputs, the registry probe"
+  echo "hits this tag and skips the kaniko rebuild. No Jenkinsfile edit needed."
 else
   echo
   echo "Built ${IMAGE} (not pushed; pass --push to push)."

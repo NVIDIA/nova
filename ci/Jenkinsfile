@@ -1024,7 +1024,7 @@ def ensureImage(Map pins) {
 
   // pins were parsed + format-validated by the caller (Phase 1). Here we
   // only assert that every pin the image build consumes is present.
-  ['buildroot_tag', 'linux_firmware_sha', 'colossus_version',
+  ['buildroot_tag', 'linux_firmware_sha', 'tap_summary_sha', 'colossus_version',
    'run_as_uid', 'run_as_gid'].each { k ->
     if (!pins[k]) error("imageBuild: ci/image-manifest is missing required pin '${k}'")
   }
@@ -1099,6 +1099,7 @@ def ensureImage(Map pins) {
           --destination='${imageFull}' \\
           --build-arg BUILDROOT_TAG=${pins.buildroot_tag} \\
           --build-arg LINUX_FIRMWARE_GIT_SHA=${pins.linux_firmware_sha} \\
+          --build-arg TAP_SUMMARY_GIT_SHA=${pins.tap_summary_sha} \\
           --build-arg RUN_AS_UID=${pins.run_as_uid} \\
           --build-arg RUN_AS_GID=${pins.run_as_gid} \\
           --snapshot-mode=redo \\
