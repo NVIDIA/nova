@@ -478,7 +478,7 @@ struct GspCommand<'a> {
 
 /// A message ready to be processed from the message queue.
 ///
-/// This is the type returned by [`Cmdq::wait_for_msg`].
+/// This is the type returned by [`CmdqInner::wait_for_msg`].
 struct GspMessage<'a> {
     // Reference to the header of the message.
     header: &'a GspMsgElement,
