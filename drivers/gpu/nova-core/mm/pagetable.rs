@@ -10,6 +10,7 @@
 
 pub(super) mod ver2;
 pub(super) mod ver3;
+pub(super) mod walk;
 
 use kernel::{
     io::Io,
