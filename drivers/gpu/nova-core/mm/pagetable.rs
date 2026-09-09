@@ -8,6 +8,7 @@
 
 #![expect(dead_code)]
 
+pub(super) mod map;
 pub(super) mod ver2;
 pub(super) mod ver3;
 pub(super) mod walk;
