@@ -9,6 +9,7 @@
 #![expect(dead_code)]
 
 pub(super) mod ver2;
+pub(super) mod ver3;
 
 use kernel::{
     io::Io,
