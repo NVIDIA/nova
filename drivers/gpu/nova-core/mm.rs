@@ -65,6 +65,7 @@ pub(super) mod pagetable;
 mod pramin;
 mod regs;
 pub(super) mod tlb;
+pub(super) mod vmm;
 
 /// GPU Memory Manager - owns all core MM components.
 ///
