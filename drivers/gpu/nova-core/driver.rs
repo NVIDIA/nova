@@ -38,6 +38,8 @@ const BAR0_SIZE: usize = SZ_16M;
 
 pub(crate) type Bar0<'a> = &'a pci::Bar<'a, BAR0_SIZE>;
 pub(crate) type NovaRegisters = kernel::io::Region<BAR0_SIZE>;
+#[expect(dead_code)]
+pub(crate) type Bar1<'a> = pci::Bar<'a>;
 
 kernel::pci_device_table!(
     PCI_TABLE,
