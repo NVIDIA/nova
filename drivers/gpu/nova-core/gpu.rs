@@ -6,11 +6,16 @@ use kernel::{
     device,
     dma::Device,
     fmt,
+    gpu::buddy::GpuBuddyParams,
     io::Io,
     num::Bounded,
     pci,
     prelude::*,
-    sizes::SizeConstants, //
+    ptr::Alignment,
+    sizes::{
+        SizeConstants,
+        SZ_4K, //
+    },
 };
 
 use crate::{
@@ -422,11 +427,21 @@ impl<'gpu> Gpu<'gpu> {
             },
 
             // Create GPU memory manager owning memory management resources.
-            mm: GpuMm::new(
-                bar,
-                gsp_resources.spec.chipset,
-                VramAddress::from_raw(gsp_static_info.total_fb_end),
-            )?,
+            mm: {
+                let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
+                let buddy_params = GpuBuddyParams {
+                    base_offset: usable_vram.start,
+                    size: usable_vram.end - usable_vram.start,
+                    chunk_size: Alignment::new::<SZ_4K>(),
+                };
+
+                GpuMm::new(
+                    bar,
+                    gsp_resources.spec.chipset,
+                    buddy_params,
+                    VramAddress::from_raw(gsp_static_info.total_fb_end),
+                )?
+            },
         })
     }
 

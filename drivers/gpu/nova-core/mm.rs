@@ -40,6 +40,10 @@ use core::{
 use kernel::{
     bitfield,
     fmt,
+    gpu::buddy::{
+        GpuBuddy,
+        GpuBuddyParams, //
+    },
     num::Bounded,
     prelude::*,
     ptr::{
@@ -54,16 +58,23 @@ use crate::{
     gpu::Chipset, //
 };
 
+pub(crate) use tlb::Tlb;
+
 mod hal;
 mod pramin;
 mod regs;
+pub(super) mod tlb;
 
 /// GPU Memory Manager - owns all core MM components.
 ///
 /// Provides centralized ownership of memory management resources:
+/// - [`GpuBuddy`] allocator for VRAM page table allocation.
 /// - [`pramin::Pramin`] for direct VRAM access.
+/// - [`Tlb`] manager for translation buffer flush operations.
 pub(crate) struct GpuMm<'gpu> {
+    buddy: GpuBuddy,
     pramin: pramin::Pramin<'gpu>,
+    tlb: Pin<KBox<Tlb<'gpu>>>,
 }
 
 impl<'gpu> GpuMm<'gpu> {
@@ -71,6 +82,7 @@ impl<'gpu> GpuMm<'gpu> {
     pub(crate) fn new(
         bar: Bar0<'gpu>,
         chipset: Chipset,
+        buddy_params: GpuBuddyParams,
         total_fb_end: VramAddress,
     ) -> Result<Self> {
         // PRAMIN covers all physical VRAM (including GSP-reserved areas
@@ -78,13 +90,25 @@ impl<'gpu> GpuMm<'gpu> {
         let vram_region = VramAddress::ZERO..total_fb_end;
 
         Ok(Self {
+            buddy: GpuBuddy::new(buddy_params)?,
             pramin: pramin::Pramin::new(bar, chipset, vram_region)?,
+            tlb: KBox::pin_init(Tlb::new(bar), GFP_KERNEL)?,
         })
+    }
+
+    /// Access the [`GpuBuddy`] allocator.
+    pub(crate) fn buddy(&self) -> &GpuBuddy {
+        &self.buddy
     }
 
     /// Access the [`pramin::Pramin`].
     fn pramin_mut(&mut self) -> &mut pramin::Pramin<'gpu> {
         &mut self.pramin
+    }
+
+    /// Access the [`Tlb`] manager.
+    pub(crate) fn tlb(&self) -> &Tlb<'gpu> {
+        self.tlb.as_ref().get_ref()
     }
 }
 
