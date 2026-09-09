@@ -8,9 +8,20 @@
 
 #![expect(dead_code)]
 
-use kernel::num::Bounded;
+use kernel::{
+    io::Io,
+    num::Bounded,
+    prelude::*, //
+};
 
-use crate::gpu::Architecture;
+use crate::{
+    gpu::Architecture,
+    mm::{
+        pramin,
+        Pfn,
+        VramAddress, //
+    },
+};
 
 /// Extracts the page table index at a given level from a virtual address.
 pub(super) trait VaLevelIndex {
@@ -81,6 +92,41 @@ impl PageTableLevel {
             Self::L4 => 4,
             Self::L5 => 5,
         }
+    }
+}
+
+// Trait abstractions for page table operations.
+
+/// Operations on Page Table Entries (`PTE`s).
+pub(super) trait PteOps: Copy + core::fmt::Debug + Into<u64> {
+    /// Create a `PTE` from a raw `u64` value.
+    fn from_raw(val: u64) -> Self;
+
+    /// Create an invalid `PTE`.
+    fn invalid() -> Self;
+
+    /// Create a valid `PTE` for the given memory aperture.
+    fn new(aperture: AperturePte, pfn: Pfn, writable: bool) -> Self;
+
+    /// Check if this `PTE` is valid.
+    fn is_valid(&self) -> bool;
+
+    /// Get the physical frame number.
+    fn frame_number(&self) -> Pfn;
+
+    /// Read a `PTE` from VRAM.
+    fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
+        let val = pramin.window_at::<u64>(addr)?.view().read_val();
+        Ok(Self::from_raw(val))
+    }
+
+    /// Write this `PTE` to VRAM.
+    fn write(&self, pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result {
+        pramin
+            .window_at::<u64>(addr)?
+            .view()
+            .write_val((*self).into());
+        Ok(())
     }
 }
 
