@@ -130,6 +130,47 @@ pub(super) trait PteOps: Copy + core::fmt::Debug + Into<u64> {
     }
 }
 
+/// Operations on Page Directory Entries (`PDE`s).
+pub(super) trait PdeOps: Copy + core::fmt::Debug + Into<u64> {
+    /// Create a `PDE` from a raw `u64` value.
+    fn from_raw(val: u64) -> Self;
+
+    /// Create a valid `PDE` pointing to a page table in the given aperture.
+    fn new(aperture: AperturePde, table_pfn: Pfn) -> Self;
+
+    /// Create an invalid `PDE`.
+    fn invalid() -> Self;
+
+    /// Check if this `PDE` is valid.
+    fn is_valid(&self) -> bool;
+
+    /// Get the memory aperture of this `PDE`.
+    fn aperture(&self) -> AperturePde;
+
+    /// Get the VRAM address of the page table.
+    fn table_vram_address(&self) -> VramAddress;
+
+    /// Read a `PDE` from VRAM.
+    fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
+        let val = pramin.window_at::<u64>(addr)?.view().read_val();
+        Ok(Self::from_raw(val))
+    }
+
+    /// Write this `PDE` to VRAM.
+    fn write(&self, pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result {
+        pramin
+            .window_at::<u64>(addr)?
+            .view()
+            .write_val((*self).into());
+        Ok(())
+    }
+
+    /// Check if this `PDE` is valid and points to video memory.
+    fn is_valid_vram(&self) -> bool {
+        self.is_valid() && self.aperture() == AperturePde::VideoMemory
+    }
+}
+
 /// Memory aperture for Page Table Entries (`PTE`s).
 ///
 /// Determines which memory region the `PTE` points to.
