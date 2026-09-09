@@ -16,11 +16,15 @@ use kernel::{
         SizeConstants,
         SZ_4K, //
     },
+    sync::Arc,
 };
 
 use crate::{
     bounded_enum,
-    driver::Bar0,
+    driver::{
+        Bar0,
+        Bar1, //
+    },
     falcon::{
         gsp::Gsp as GspFalcon,
         sec2::Sec2 as Sec2Falcon,
@@ -35,6 +39,8 @@ use crate::{
         GspBootContext, //
     },
     mm::{
+        bar_user::BarUser,
+        pagetable::MmuVersion,
         GpuMm,
         VramAddress, //
     },
@@ -147,6 +153,11 @@ impl Chipset {
     /// Returns the address range of the PCI config mirror space.
     pub(crate) fn pci_config_mirror_range(self) -> Range<u32> {
         hal::gpu_hal(self).pci_config_mirror_range()
+    }
+
+    /// Returns the MMU version for this chipset.
+    pub(crate) fn mmu_version(self) -> MmuVersion {
+        MmuVersion::from(self.arch())
     }
 }
 
@@ -297,6 +308,8 @@ pub(crate) struct Gpu<'gpu> {
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
     /// the GSP is still operational.
     mm: GpuMm<'gpu>,
+    /// BAR1 user interface for CPU access to GPU virtual memory.
+    bar_user: Arc<BarUser<'gpu>>,
     /// GSP and its resources.
     #[pin]
     gsp_resources: GspResources<'gpu>,
@@ -340,6 +353,7 @@ impl<'gpu> Gpu<'gpu> {
     pub(crate) fn new<'a>(
         pdev: &'gpu pci::Device<device::Core<'a>>,
         bar: Bar0<'gpu>,
+        bar1: &'gpu Bar1<'gpu>,
     ) -> impl PinInit<Self, Error> + use<'gpu, 'a> {
         let dev = pdev.as_ref();
 
@@ -440,6 +454,22 @@ impl<'gpu> Gpu<'gpu> {
                     gsp_resources.spec.chipset,
                     buddy_params,
                     VramAddress::from_raw(gsp_static_info.total_fb_end),
+                )?
+            },
+
+            // Create BAR1 user interface for CPU access to GPU virtual memory.
+            bar_user: {
+                let pdb_addr = VramAddress::from_raw(gsp_static_info.bar1_pde_base);
+                let bar1_idx = crate::driver::bar1_resource_index(pdev)?;
+                let bar1_size = pdev.resource_len(bar1_idx)?;
+                Arc::pin_init(
+                    BarUser::new(
+                        pdb_addr,
+                        gsp_resources.spec.chipset,
+                        bar1_size,
+                        bar1,
+                    )?,
+                    GFP_KERNEL,
                 )?
             },
         })

@@ -60,6 +60,7 @@ use crate::{
 
 pub(crate) use tlb::Tlb;
 
+pub(crate) mod bar_user;
 mod hal;
 pub(super) mod pagetable;
 mod pramin;
