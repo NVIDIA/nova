@@ -61,6 +61,7 @@ use crate::{
 pub(crate) use tlb::Tlb;
 
 mod hal;
+pub(super) mod pagetable;
 mod pramin;
 mod regs;
 pub(super) mod tlb;
