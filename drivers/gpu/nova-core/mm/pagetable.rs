@@ -398,3 +398,27 @@ impl From<AperturePde> for Bounded<u64, 2> {
         Bounded::from_expr(val as u64 & 0x3)
     }
 }
+
+/// Check if the PDB has valid, VRAM-backed page tables.
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+fn check_pdb_inner<M: MmuConfig>(pramin: &mut pramin::Pramin<'_>, pdb_addr: VramAddress) -> Result {
+    let raw = pramin.window_at::<u64>(pdb_addr)?.view().read_val();
+
+    if !M::Pde::from_raw(raw).is_valid_vram() {
+        return Err(ENOENT);
+    }
+    Ok(())
+}
+
+/// Check if the PDB has valid, VRAM-backed page tables, dispatching by MMU version.
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+pub(super) fn check_pdb_valid(
+    pramin: &mut pramin::Pramin<'_>,
+    pdb_addr: VramAddress,
+    chipset: crate::gpu::Chipset,
+) -> Result {
+    match MmuVersion::from(chipset.arch()) {
+        MmuVersion::V2 => check_pdb_inner::<MmuV2>(pramin, pdb_addr),
+        MmuVersion::V3 => check_pdb_inner::<MmuV3>(pramin, pdb_addr),
+    }
+}

@@ -3,7 +3,7 @@
 
 //! Memory management subsystems.
 
-#![expect(dead_code)]
+#![cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), expect(dead_code))]
 
 /// Implements `From` conversions between a frame-number type and `Bounded<u64, N>`.
 ///
@@ -202,6 +202,7 @@ bitfield! {
 
 impl VirtualAddress {
     /// Create a new virtual address from a raw value.
+    #[expect(dead_code)]
     pub(crate) const fn new(addr: u64) -> Self {
         Self::from_raw(addr)
     }
@@ -297,7 +298,8 @@ pub(crate) mod selftest {
 
     use kernel::{
         device,
-        sizes::SizeConstants, //
+        sizes::SizeConstants,
+        sync::Arc, //
     };
 
     use super::*;
@@ -307,6 +309,9 @@ pub(crate) mod selftest {
         dev: &device::Device<device::Bound>,
         mm: &mut GpuMm<'_>,
         usable_fb_regions: &[Range<u64>],
+        bar_user: &Arc<bar_user::BarUser<'_>>,
+        bar1_pdb: u64,
+        chipset: Chipset,
     ) -> Result {
         // VRAM span the self-tests are free to overwrite, from the chosen test base.
         const SELFTEST_SPAN: u64 = u64::SZ_64M;
@@ -325,6 +330,7 @@ pub(crate) mod selftest {
             return Ok(());
         };
 
-        pramin::selftest::run(dev, mm.pramin_mut(), VramAddress::from_raw(base))
+        pramin::selftest::run(dev, mm.pramin_mut(), VramAddress::from_raw(base))?;
+        bar_user::run_self_test(dev, mm, bar_user, bar1_pdb, chipset)
     }
 }

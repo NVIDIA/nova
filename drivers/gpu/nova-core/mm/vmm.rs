@@ -126,6 +126,7 @@ impl Drop for MustUnmapGuard {
 /// Directory Base (`PDB`) address. Used for Channel, BAR1 and BAR2 mappings.
 pub(crate) struct Vmm {
     /// Page Directory Base address for this address space.
+    #[expect(dead_code)]
     pdb_addr: VramAddress,
     /// Page table walker for reading existing mappings.
     pt_walk: PtWalk,
