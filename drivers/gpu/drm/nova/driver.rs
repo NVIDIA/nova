@@ -79,7 +79,7 @@ impl auxiliary::Driver for NovaDriver {
 
                 // SAFETY: `reg` is stored in `Self::Data` and dropped when the driver is unbound;
                 // it is never forgotten.
-                unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data, 0) }
+                unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data) }
             },
             drm: reg.device().into(),
         })

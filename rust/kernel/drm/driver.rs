@@ -169,7 +169,6 @@ impl<'a, T: Driver> Registration<'a, T> {
         dev: &'a device::Device<device::Bound>,
         drm: drm::UnregisteredDevice<T>,
         data: impl PinInit<T::RegistrationData<'a>, E>,
-        flags: usize,
     ) -> impl PinInit<Self, Error>
     where
         Error: From<E>,
@@ -196,7 +195,7 @@ impl<'a, T: Driver> Registration<'a, T> {
                 unsafe { *drm.registration_data.get() = ptr };
 
                 // SAFETY: `drm` is a valid, initialized but not yet registered DRM device.
-                let ret = unsafe { bindings::drm_dev_register(drm.as_raw(), flags) };
+                let ret = unsafe { bindings::drm_dev_register(drm.as_raw(), 0) };
                 to_result(ret).inspect_err(|_| {
                     // SAFETY: `drm_dev_register()` synchronizes SRCU on failure, so no
                     // concurrent access to `registration_data` is possible at this point.

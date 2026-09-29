@@ -183,7 +183,6 @@ impl platform::Driver for TyrPlatformDriver {
                         iomem,
                         gpu_info,
                     }),
-                    0,
                 )},
                 _: { dev_dbg!(pdev, "Tyr initialized correctly.") },
             }))
