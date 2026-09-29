@@ -25,10 +25,11 @@ use nova_core::api::{
 
 pub(crate) struct NovaDriver;
 
+#[pin_data]
 pub(crate) struct Nova<'bound> {
-    #[expect(unused)]
     drm: ARef<drm::Device<NovaDriver>>,
-    _reg: drm::Registration<'bound, NovaDriver>,
+    #[pin]
+    reg: drm::Registration<'bound, NovaDriver>,
 }
 
 /// DRM registration data, accessible from ioctl handlers via the registration guard.
@@ -68,17 +69,19 @@ impl auxiliary::Driver for NovaDriver {
         adev: &'bound auxiliary::Device<Core<'_>>,
         _info: &'bound Self::IdInfo,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let drm = drm::UnregisteredDevice::<Self>::new(adev, Ok(()))?;
-        let reg_data = DrmRegData {
-            api: NovaCoreApi::of(adev)?,
-        };
-        // SAFETY: `reg` is stored in `Nova` and dropped when the driver is unbound; it is
-        // never forgotten.
-        let reg = unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data, 0)? };
+        try_pin_init!(Self::Data {
+            reg <- {
+                let drm = drm::UnregisteredDevice::<Self>::new(adev, Ok(()))?;
 
-        Ok(Nova {
+                let reg_data = DrmRegData {
+                    api: NovaCoreApi::of(adev)?,
+                };
+
+                // SAFETY: `reg` is stored in `Self::Data` and dropped when the driver is unbound;
+                // it is never forgotten.
+                unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data, 0) }
+            },
             drm: reg.device().into(),
-            _reg: reg,
         })
     }
 }
