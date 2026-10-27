@@ -775,8 +775,7 @@ impl CmdqInner<'_> {
     /// # Errors
     ///
     /// - `ETIMEDOUT` if `timeout` has elapsed before any message becomes available.
-    /// - `EIO` if there was some inconsistency (e.g. message shorter than advertised) on the
-    ///   message queue.
+    /// - `EIO` if a message fails framing or checksum validation.
     fn wait_for_msg(&self, timeout: Delta) -> Result<GspMessage<'_>> {
         // Wait for a message to arrive from the GSP.
         let (slice_1, slice_2) = read_poll_timeout(
@@ -849,8 +848,7 @@ impl CmdqInner<'_> {
     /// # Errors
     ///
     /// - `ETIMEDOUT` if `timeout` has elapsed before any message becomes available.
-    /// - `EIO` if there was some inconsistency (e.g. message shorter than advertised) on the
-    ///   message queue.
+    /// - `EIO` if a message fails framing or checksum validation.
     /// - `ENOMSG` if the message was not the awaited reply.
     ///
     /// Error codes returned by [`MessageFromGsp::read`] are propagated as-is.
@@ -902,7 +900,7 @@ impl CmdqInner<'_> {
     ///
     /// - `ETIMEDOUT` if no message of type `M` arrives before the deadline, however many other
     ///   messages arrive while waiting.
-    /// - `EIO` if a message fails framing or checksum validation (see [`Self::wait_for_msg`]).
+    /// - `EIO` if a message fails framing or checksum validation.
     ///
     /// Error codes returned by [`MessageFromGsp::read`] are propagated as-is.
     fn await_msg<M: MessageFromGsp>(&mut self) -> Result<M>
