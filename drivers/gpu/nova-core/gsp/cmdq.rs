@@ -54,6 +54,7 @@ use crate::{
             MsgFunction,
             MsgqRxHeader,
             MsgqTxHeader,
+            RpcMessageHeader,
             GSP_MSG_QUEUE_ELEMENT_SIZE_MAX, //
         },
         PteArray,
@@ -688,11 +689,22 @@ impl CmdqInner<'_> {
         let (cmd, payload_1) = M::Command::from_bytes_mut_prefix(dst.contents.0).ok_or(EIO)?;
 
         // Fill the header and command in-place.
-        let msg_element = GspMsgElement::init(self.seq, size_in_bytes, M::FUNCTION);
-        // SAFETY: `msg_header` and `cmd` are valid references, and not touched if the initializer
-        // fails.
+        let msg_element_init = GspMsgElement::init(self.seq, size_in_bytes);
+        let rpc_header_init = RpcMessageHeader::init(size_in_bytes, M::FUNCTION);
+        // SAFETY: `dst.header` is a valid reference, and is not touched if the initializer fails.
         unsafe {
-            pin_init::raw_try_init(core::ptr::from_mut(dst.header), msg_element)?;
+            pin_init::raw_try_init(core::ptr::from_mut(dst.header), msg_element_init)?;
+        }
+        // SAFETY: `dst.header.rpc_header_mut()` is a valid reference, and is not touched if the
+        // initializer fails.
+        unsafe {
+            pin_init::raw_try_init(
+                core::ptr::from_mut(dst.header.rpc_header_mut()),
+                rpc_header_init,
+            )?;
+        }
+        // SAFETY: `cmd` is a valid reference, and is not touched if the initializer fails.
+        unsafe {
             pin_init::raw_try_init(core::ptr::from_mut(cmd), command.init())?;
         }
 
@@ -718,7 +730,7 @@ impl CmdqInner<'_> {
             "GSP RPC: send: seq# {}, function={:?}, length=0x{:x}\n",
             self.seq,
             M::FUNCTION,
-            dst.header.length(),
+            size_in_bytes,
         );
 
         // All set - update the write pointer and inform the GSP of the new command.
@@ -791,22 +803,24 @@ impl CmdqInner<'_> {
 
         // Validate checksum after truncating the message to its exact length.
         if Cmdq::calculate_checksum(
-            SBufferIter::new_reader([header.as_bytes(), slice_1, slice_2]).take(header.length()),
+            SBufferIter::new_reader([header.as_bytes(), slice_1, slice_2])
+                .take(header.msg_length()),
         ) != 0
         {
             dev_err!(&self.dev, "GSP receive: bad checksum\n");
             return Err(EIO);
         }
 
+        let rpc_header = header.rpc_header();
+        let payload_length = rpc_header.rpc_length();
+
         dev_dbg!(
             &self.dev,
             "GSP RPC: receive: seq# {}, function={:?}, length=0x{:x}\n",
-            header.sequence(),
-            header.function(),
-            header.length(),
+            rpc_header.sequence(),
+            rpc_header.function(),
+            payload_length,
         );
-
-        let payload_length = header.payload_length();
 
         // Check that the driver read area is large enough for the message.
         if slice_1.len() + slice_2.len() < payload_length {
@@ -852,8 +866,9 @@ impl CmdqInner<'_> {
         Error: From<M::InitError>,
     {
         let message = self.wait_for_msg(timeout)?;
-        let function = message.header.function();
-        let seq = message.header.sequence();
+        let rpc_header = message.header.rpc_header();
+        let function = rpc_header.function();
+        let seq = rpc_header.sequence();
 
         // An early return here would leave the read pointer on this message.
         let result = if matches!(function, Ok(f) if f == M::FUNCTION) {
@@ -879,7 +894,7 @@ impl CmdqInner<'_> {
 
         // Advance the read pointer past this message.
         self.gsp_mem.advance_cpu_read_ptr(u32::try_from(
-            message.header.length().div_ceil(GSP_PAGE_SIZE),
+            message.header.msg_length().div_ceil(GSP_PAGE_SIZE),
         )?);
 
         result
@@ -958,12 +973,13 @@ impl CmdqInner<'_> {
             let msg = self.wait_for_msg(Delta::ZERO)?;
 
             let pages =
-                u32::try_from(msg.header.length().div_ceil(GSP_PAGE_SIZE)).map_err(|_| {
+                u32::try_from(msg.header.msg_length().div_ceil(GSP_PAGE_SIZE)).map_err(|_| {
                     dev_err!(&self.dev, "GSP drain: message length overflow\n");
                     EIO
                 })?;
-            let function = msg.header.function();
-            let seq = msg.header.sequence();
+            let rpc_header = msg.header.rpc_header();
+            let function = rpc_header.function();
+            let seq = rpc_header.sequence();
 
             self.gsp_mem.advance_cpu_read_ptr(pages);
             self.log_event(function, seq);
