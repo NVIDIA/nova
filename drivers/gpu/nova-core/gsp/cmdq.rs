@@ -909,12 +909,24 @@ impl CmdqInner<'_> {
     /// - `EIO` if a message fails framing or checksum validation.
     fn wait_for_msg(&self, timeout: Delta) -> Result<GspMessage<'_>> {
         // Wait for a message to arrive from the GSP.
-        let (slice_1, slice_2) = read_poll_timeout(
-            || Ok(self.gsp_mem.driver_read_area()),
-            |driver_area| !driver_area.0.is_empty(),
-            Delta::from_millis(1),
-            timeout,
-        )
+        let (slice_1, slice_2) = if timeout == Delta::ZERO {
+            // If `timeout == Delta::ZERO`, check the message queue once as `read_poll_timeout` can
+            // potentially sleep if the clock hasn't moved forward while the condition was being
+            // checked.
+            let slices = self.gsp_mem.driver_read_area();
+            if !slices.0.is_empty() {
+                Ok(slices)
+            } else {
+                Err(ETIMEDOUT)
+            }
+        } else {
+            read_poll_timeout(
+                || Ok(self.gsp_mem.driver_read_area()),
+                |driver_area| !driver_area.0.is_empty(),
+                Delta::from_millis(1),
+                timeout,
+            )
+        }
         .map(|(slice_1, slice_2)| (slice_1.as_flattened(), slice_2.as_flattened()))?;
 
         // Extract the `GspMsgElement`.
