@@ -23,9 +23,11 @@ use crate::{
     gpu::Chipset,
     gsp::{
         cmdq::{
+            rpc::{
+                CommandToGsp,
+                MessageFromGsp, //
+            },
             Cmdq,
-            CommandToGsp,
-            MessageFromGsp,
             NoReply, //
         },
         fw::{
