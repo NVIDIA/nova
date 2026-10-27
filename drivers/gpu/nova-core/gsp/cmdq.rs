@@ -651,6 +651,15 @@ enum GspParsedMessage<'a> {
     Rpc(RpcMessage<'a>),
 }
 
+impl GspParsedMessage<'_> {
+    /// Log the message on `dev`.
+    fn log(&self, dev: &device::Device) {
+        match self {
+            GspParsedMessage::Rpc(rpc) => rpc.log(dev),
+        }
+    }
+}
+
 /// GSP command queue.
 ///
 /// Provides the ability to send commands and receive messages from the GSP using a shared memory
@@ -1069,21 +1078,14 @@ impl CmdqInner<'_> {
     /// `EIO` if a message fails framing or checksum validation, or if a message's page count
     /// overflows a `u32`.
     fn drain(&mut self) -> Result {
-        while !self.gsp_mem.driver_read_area().0.is_empty() {
-            // A message is available, so this returns without waiting.
-            let msg = self.wait_for_msg(Delta::ZERO)?;
-
-            let pages =
-                u32::try_from(msg.header.msg_length().div_ceil(GSP_PAGE_SIZE)).map_err(|_| {
-                    dev_err!(&self.dev, "GSP drain: message length overflow\n");
-                    EIO
-                })?;
-
-            RpcMessage::parse(self.dev, msg)?.log(self.dev);
-
-            self.gsp_mem.advance_cpu_read_ptr(pages);
+        loop {
+            match self.consume_element(Delta::ZERO, |message| message.log(self.dev)) {
+                Ok(()) => (),
+                // No more message pending on the queue, drain is complete.
+                Err(ETIMEDOUT) => return Ok(()),
+                // Other errors are fatal, and stall the queue.
+                Err(e) => return Err(e),
+            }
         }
-
-        Ok(())
     }
 }
