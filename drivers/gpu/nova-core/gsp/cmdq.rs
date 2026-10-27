@@ -645,6 +645,12 @@ impl<'a> RpcMessage<'a> {
     }
 }
 
+/// A message whose protocol layer has been parsed and validated.
+enum GspParsedMessage<'a> {
+    /// A [RPC message](RpcMessage).
+    Rpc(RpcMessage<'a>),
+}
+
 /// GSP command queue.
 ///
 /// Provides the ability to send commands and receive messages from the GSP using a shared memory
@@ -930,57 +936,42 @@ impl CmdqInner<'_> {
         })
     }
 
-    /// Receive a message from the GSP.
+    /// Wait for the next element on the message queue, pass it to `f`, advance the read pointer
+    /// past the message, and return the result of `f`.
     ///
-    /// A message whose function code is `M::FUNCTION` is decoded and returned. Any other message
-    /// is logged as an event.
-    ///
-    /// The read pointer is always advanced past the message, regardless of whether it matched.
+    /// The read pointer advances regardless of whether `f` succeeds or not.
     ///
     /// # Errors
     ///
     /// - `ETIMEDOUT` if `timeout` has elapsed before any message becomes available.
-    /// - `EIO` if a message fails framing or checksum validation.
-    /// - `ENOMSG` if the message was not the awaited reply.
+    /// - `EIO` if a message fails framing or checksum validation. In this case, the read pointer
+    ///   does not advance and the queue is stalled. This is a fatal error.
     ///
-    /// Error codes returned by [`MessageFromGsp::read`] are propagated as-is.
-    fn receive_msg<M: MessageFromGsp>(&mut self, timeout: Delta) -> Result<M>
-    where
-        // This allows all error types, including `Infallible`, to be used for `M::InitError`.
-        Error: From<M::InitError>,
-    {
+    /// If an error is returned, then `f` has not been called.
+    ///
+    /// Note that `R` may itself be a [`Result`]. In this case, the above only applies to the outer
+    /// [`Result`] returned by this method.
+    fn consume_element<R>(
+        &mut self,
+        timeout: Delta,
+        f: impl FnOnce(GspParsedMessage<'_>) -> R,
+    ) -> Result<R> {
         let message = self.wait_for_msg(timeout)?;
-        let elem_count = u32::try_from(message.header.msg_length().div_ceil(GSP_PAGE_SIZE))?;
-        let rpc_message = RpcMessage::parse(self.dev, message)?;
-        let function = rpc_message.header.function();
+        let elem_count = u32::try_from(message.header.msg_length().div_ceil(GSP_PAGE_SIZE))
+            .map_err(|_| {
+                dev_err!(&self.dev, "GSP receive: message length overflow\n");
+                EIO
+            })?;
 
-        // An early return here would leave the read pointer on this message.
-        let result = if matches!(function, Ok(f) if f == M::FUNCTION) {
-            let (cmd, contents_1) =
-                M::Message::from_bytes_prefix(rpc_message.contents.0).ok_or(EIO)?;
-            let mut sbuffer = SBufferIter::new_reader([contents_1, rpc_message.contents.1]);
+        // RPC is the only type of message supported for now.
+        let message = GspParsedMessage::Rpc(RpcMessage::parse(self.dev, message)?);
 
-            M::read(cmd, &mut sbuffer)
-                .map_err(|e| e.into())
-                .inspect(|_| {
-                    if !sbuffer.is_empty() {
-                        dev_warn!(
-                            &self.dev,
-                            "GSP message {:?} has unprocessed data\n",
-                            M::FUNCTION
-                        );
-                    }
-                })
-        } else {
-            rpc_message.log(self.dev);
-
-            Err(ENOMSG)
-        };
+        let res = f(message);
 
         // Advance the read pointer past this message.
         self.gsp_mem.advance_cpu_read_ptr(elem_count);
 
-        result
+        Ok(res)
     }
 
     /// Receives a message of type `M`, waiting up to [`Cmdq::RECEIVE_TIMEOUT`] from the call.
@@ -1000,14 +991,39 @@ impl CmdqInner<'_> {
         // This allows all error types, including `Infallible`, to be used for `M::InitError`.
         Error: From<M::InitError>,
     {
+        let f = |message: GspParsedMessage<'_>| {
+            let GspParsedMessage::Rpc(rpc_message) = message;
+            let function = rpc_message.header.function();
+            if matches!(function, Ok(f) if f == M::FUNCTION) {
+                let (cmd, contents_1) =
+                    M::Message::from_bytes_prefix(rpc_message.contents.0).ok_or(EIO)?;
+                let mut sbuffer = SBufferIter::new_reader([contents_1, rpc_message.contents.1]);
+
+                M::read(cmd, &mut sbuffer)
+                    .map_err(|e| e.into())
+                    .inspect(|_| {
+                        if !sbuffer.is_empty() {
+                            dev_warn!(
+                                self.dev,
+                                "GSP message {:?} has unprocessed data\n",
+                                M::FUNCTION
+                            );
+                        }
+                    })
+            } else {
+                rpc_message.log(self.dev);
+
+                Err(ENOMSG)
+            }
+        };
         let deadline = Instant::<Monotonic>::now() + Cmdq::RECEIVE_TIMEOUT;
         loop {
             let remaining = deadline - Instant::<Monotonic>::now();
             if remaining.is_negative() {
                 break Err(ETIMEDOUT);
             }
-            match self.receive_msg::<M>(remaining) {
-                Ok(msg) => break Ok(msg),
+            match self.consume_element(remaining, f)? {
+                Ok(m) => break Ok(m),
                 Err(ENOMSG) => continue,
                 Err(e) => break Err(e),
             }
