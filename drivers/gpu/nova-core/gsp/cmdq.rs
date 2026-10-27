@@ -615,6 +615,34 @@ impl<'a> RpcMessage<'a> {
             contents: (slice_1, slice_2),
         })
     }
+
+    /// Logs an event, meaning a message that no caller was waiting for.
+    ///
+    /// An OS error or robust-channel record is logged at error level and an unknown function code
+    /// at warning level. Other events are not logged.
+    fn log(&self, dev: &device::Device) {
+        let function = self.header.function();
+        let seq = self.header.sequence();
+
+        match function {
+            Ok(MsgFunction::OsErrorLog) => {
+                dev_err!(dev, "GSP reported an OS error (seq {})\n", seq);
+            }
+            Ok(MsgFunction::RcTriggered) => {
+                dev_err!(dev, "GSP triggered robust-channel recovery (seq {})\n", seq);
+            }
+            // Nothing to do for the remaining known function codes.
+            Ok(_) => {}
+            Err(raw) => {
+                dev_warn!(
+                    dev,
+                    "unknown GSP message function {:#x} (seq {})\n",
+                    raw,
+                    seq
+                );
+            }
+        }
+    }
 }
 
 /// GSP command queue.
@@ -944,7 +972,7 @@ impl CmdqInner<'_> {
                     }
                 })
         } else {
-            self.log_event(function, rpc_message.header.sequence());
+            rpc_message.log(self.dev);
 
             Err(ENOMSG)
         };
@@ -986,36 +1014,6 @@ impl CmdqInner<'_> {
         }
     }
 
-    /// Logs an event, meaning a message that no caller was waiting for.
-    ///
-    /// An OS error or robust-channel record is logged at error level and an unknown function code
-    /// at warning level. Every other event is recorded only by the receive trace in
-    /// [`Self::wait_for_msg`].
-    fn log_event(&self, function: Result<MsgFunction, u32>, seq: u32) {
-        match function {
-            Ok(MsgFunction::OsErrorLog) => {
-                dev_err!(&self.dev, "GSP reported an OS error (seq {})\n", seq);
-            }
-            Ok(MsgFunction::RcTriggered) => {
-                dev_err!(
-                    &self.dev,
-                    "GSP triggered robust-channel recovery (seq {})\n",
-                    seq
-                );
-            }
-            // Nothing to do for the remaining known function codes.
-            Ok(_) => {}
-            Err(raw) => {
-                dev_warn!(
-                    &self.dev,
-                    "unknown GSP message function {:#x} (seq {})\n",
-                    raw,
-                    seq
-                );
-            }
-        }
-    }
-
     /// Logs and consumes every message the queue holds.
     ///
     /// # Errors
@@ -1032,12 +1030,10 @@ impl CmdqInner<'_> {
                     dev_err!(&self.dev, "GSP drain: message length overflow\n");
                     EIO
                 })?;
-            let rpc_msg = RpcMessage::parse(self.dev, msg)?;
-            let function = rpc_msg.header.function();
-            let seq = rpc_msg.header.sequence();
+
+            RpcMessage::parse(self.dev, msg)?.log(self.dev);
 
             self.gsp_mem.advance_cpu_read_ptr(pages);
-            self.log_event(function, seq);
         }
 
         Ok(())
