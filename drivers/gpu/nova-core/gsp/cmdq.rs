@@ -974,6 +974,36 @@ impl CmdqInner<'_> {
         Ok(res)
     }
 
+    /// Consumes messages from the queue until a message that satisfies `f` is encountered, and
+    /// returns the result of `f`.
+    ///
+    /// The message is waited for up to [`Cmdq::RECEIVE_TIMEOUT`] from the call.
+    ///
+    /// `f` is expected to return `Ok` with the result to return to the caller, and `Err(ENOMSG)` to
+    /// signal that the received message was not the one expected (such messages are dropped). Any
+    /// other error returned by `f` is propagated to the caller.
+    ///
+    /// # Errors
+    ///
+    /// - `ETIMEDOUT` if no message satisfying `f` arrives before the deadline, however many other
+    ///   messages arrive while waiting.
+    /// - `EIO` if a message fails framing or checksum validation.
+    /// - Any error returned by `f` with the exception of `ENOMSG`.
+    fn await_msg_with<R>(&mut self, f: impl Fn(GspParsedMessage<'_>) -> Result<R>) -> Result<R> {
+        let deadline = Instant::<Monotonic>::now() + Cmdq::RECEIVE_TIMEOUT;
+        loop {
+            let remaining = deadline - Instant::<Monotonic>::now();
+            if remaining.is_negative() {
+                break Err(ETIMEDOUT);
+            }
+            match self.consume_element(remaining, &f)? {
+                Ok(m) => break Ok(m),
+                Err(ENOMSG) => continue,
+                Err(e) => break Err(e),
+            }
+        }
+    }
+
     /// Receives a message of type `M`, waiting up to [`Cmdq::RECEIVE_TIMEOUT`] from the call.
     ///
     /// Any other message that arrives first is logged as an event and does not extend the
@@ -1016,18 +1046,8 @@ impl CmdqInner<'_> {
                 Err(ENOMSG)
             }
         };
-        let deadline = Instant::<Monotonic>::now() + Cmdq::RECEIVE_TIMEOUT;
-        loop {
-            let remaining = deadline - Instant::<Monotonic>::now();
-            if remaining.is_negative() {
-                break Err(ETIMEDOUT);
-            }
-            match self.consume_element(remaining, f)? {
-                Ok(m) => break Ok(m),
-                Err(ENOMSG) => continue,
-                Err(e) => break Err(e),
-            }
-        }
+
+        self.await_msg_with(f)
     }
 
     /// Logs and consumes every message the queue holds.
