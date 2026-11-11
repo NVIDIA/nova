@@ -50,10 +50,11 @@ use crate::{
         NvdmHeader,
         NvdmType, //
     },
-    regs, //
+    regs as bootregs, //
 };
 
 mod hal;
+mod regs;
 
 /// PRC message sub-command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +390,7 @@ impl<'a> FmcBootArgs<'a> {
 pub(crate) struct Fsp<'a> {
     falcon: Falcon<'a, FspEngine>,
     fmc_fw: GspFmcFirmware<'a>,
+    hal: &'static dyn hal::FspHal,
 }
 
 impl<'a> Fsp<'a> {
@@ -428,7 +430,7 @@ impl<'a> Fsp<'a> {
 
         read_poll_timeout(
             || Ok(hal.fsp_boot_status(bar)),
-            |&status| status == regs::NV_THERM_I2CS_SCRATCH_FSP_BOOT_COMPLETE_STATUS_SUCCESS,
+            |&status| status == bootregs::NV_THERM_I2CS_SCRATCH_FSP_BOOT_COMPLETE_STATUS_SUCCESS,
             Delta::from_millis(10),
             Delta::from_millis(FSP_SECURE_BOOT_TIMEOUT_MS),
         )
@@ -436,7 +438,11 @@ impl<'a> Fsp<'a> {
             dev_err!(dev, "FSP secure boot completion error: {:?}\n", e);
         })?;
 
-        Ok(Fsp { falcon, fmc_fw })
+        Ok(Fsp {
+            falcon,
+            fmc_fw,
+            hal,
+        })
     }
 
     /// Sends a message to FSP and waits for the response.
@@ -548,5 +554,9 @@ impl<'a> Fsp<'a> {
 
         dev_dbg!(dev, "FSP Chain of Trust completed successfully\n");
         Ok(())
+    }
+
+    pub(crate) fn is_bug_3957833_affected(&self, bar: Bar0<'_>) -> bool {
+        self.hal.is_bug_3957833_affected(bar)
     }
 }
