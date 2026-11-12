@@ -578,7 +578,7 @@ impl CmdqInner<'_> {
 
         // All set - update the write pointer and inform the GSP of the new command.
         let elem_count = dst.header.element_count();
-        self.seq += 1;
+        self.seq = self.seq.wrapping_add(1);
         self.gsp_mem.advance_cpu_write_ptr(elem_count);
 
         Ok(seq)
